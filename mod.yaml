@@ -154,39 +154,6 @@ sensor:
       - delta: 0.5
     on_value:
       - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
-  # Room temperature sensors
-  - platform: homeassistant
-    id: temp_master_bedroom
-    entity_id: sensor.atc_f362_temperature
-    internal: true
-    filters:
-      - delta: 0.5
-    on_value:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
-  - platform: homeassistant
-    id: temp_adas_room
-    entity_id: sensor.atc_36c2_temperature
-    internal: true
-    filters:
-      - delta: 0.5
-    on_value:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
-  - platform: homeassistant
-    id: temp_office
-    entity_id: sensor.office_temperature_sensor_temperature
-    internal: true
-    filters:
-      - delta: 0.5
-    on_value:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
-  - platform: homeassistant
-    id: temp_sunroom
-    entity_id: sensor.sunroom_thermometer_temperature
-    internal: true
-    filters:
-      - delta: 0.5
-    on_value:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
 
   - platform: template
     id: battery_pct
@@ -327,26 +294,19 @@ touchscreen:
             else if (row == 1) id(pending_action) = 4;
             else if (row == 2) id(pending_action) = 5;
           } else if (id(active_room) == 2) {
-            // Climate tab — custom hit regions per row
-            // Row 0 (y 100–206): main thermostat
-            //   mode badge: x 350–540  → action 11
-            //   minus btn:  x 130–240  → action 7
-            //   plus btn:   x 260–370  → action 6
-            // Row 1 (y 220–326): upstairs thermostat
-            //   mode badge: x 350–540  → action 12
-            //   minus btn:  x 130–240  → action 9
-            //   plus btn:   x 260–370  → action 8
-            // Row 2 (y 340–446): HRV toggle
-            //   anywhere    → action 10
-            if (row == 0) {
-              if (tx >= 350) id(pending_action) = 11;
-              else if (tx >= 260) id(pending_action) = 6;
-              else if (tx >= 130) id(pending_action) = 7;
-            } else if (row == 1) {
-              if (tx >= 350) id(pending_action) = 12;
-              else if (tx >= 260) id(pending_action) = 8;
-              else if (tx >= 130) id(pending_action) = 9;
-            } else if (row == 2) {
+            // Climate tab — explicit y-ranges (rows are 220px, not uniform 120px)
+            // Thermo 1: y 100–320  mode badge x≥360 / plus x≥265 / minus x≥40
+            // Thermo 2: y 336–556  same x regions
+            // HRV:      y 572–692  anywhere
+            if (ty >= 100 && ty < 320) {
+              if (tx >= 360) id(pending_action) = 11;
+              else if (tx >= 265) id(pending_action) = 6;
+              else if (tx >= 40) id(pending_action) = 7;
+            } else if (ty >= 336 && ty < 556) {
+              if (tx >= 360) id(pending_action) = 12;
+              else if (tx >= 265) id(pending_action) = 8;
+              else if (tx >= 40) id(pending_action) = 9;
+            } else if (ty >= 572 && ty < 692) {
               id(pending_action) = 10;
             }
           }
@@ -635,83 +595,63 @@ display:
           return std::string(buf);
         };
 
-        // ── draw_thermo_row: thermostat control row ──────────────────────────
-        // row_y: top y of 106px row
-        // label: thermostat name
-        // cur_c, set_c: current/setpoint temps in °C (NaN if unavailable)
-        // hvac_mode: "heat", "cool", "off", "" if unavailable
-        // hvac_action: "heating", "cooling", "idle", "off", ""
+        // ── draw_thermo_row: 220px tall thermostat control row ──────────────
         auto draw_thermo_row = [&](int row_y, const char *label,
                                    float cur_c, float set_c,
                                    const std::string &hvac_mode,
                                    const std::string &hvac_action) {
-          it.rectangle(16, row_y, W - 32, 106, black);
+          it.rectangle(16, row_y, W - 32, 220, black);
 
-          // Thermometer icon
-          it.print(58, row_y + 53, id(mdi40), black, TextAlign::CENTER, "\U000F050F");
+          // Thermometer icon (top-left area)
+          it.print(58, row_y + 55, id(mdi40), black, TextAlign::CENTER, "\U000F050F");
 
-          // Label + current temp
-          it.print(90, row_y + 28, id(roboto20), black, TextAlign::CENTER_LEFT, label);
+          // Label + current temp (top-left, beside icon)
+          it.print(90, row_y + 24, id(roboto20), black, TextAlign::CENTER_LEFT, label);
           std::string cur_str = fmt_temp_f(cur_c);
-          it.print(90, row_y + 58, id(roboto24), black, TextAlign::CENTER_LEFT, cur_str.c_str());
+          it.print(90, row_y + 60, id(roboto24), black, TextAlign::CENTER_LEFT, cur_str.c_str());
 
-          // Mode badge (tappable, x 350–540)
+          // Mode badge (top-right, tappable, x 340–524)
           const char *mode_label = "---";
           bool active = false;
           if (hvac_mode == "heat") { mode_label = "HEAT"; active = (hvac_action == "heating"); }
           else if (hvac_mode == "cool") { mode_label = "COOL"; active = (hvac_action == "cooling"); }
           else if (hvac_mode == "off")  { mode_label = "OFF";  active = false; }
           if (active) {
-            it.filled_rectangle(350, row_y + 6, 174, 44, black);
-            it.print(437, row_y + 28, id(roboto20), white, TextAlign::CENTER, mode_label);
+            it.filled_rectangle(340, row_y + 8, 184, 56, black);
+            it.print(432, row_y + 36, id(roboto24), white, TextAlign::CENTER, mode_label);
           } else {
-            it.rectangle(350, row_y + 6, 174, 44, black);
-            it.print(437, row_y + 28, id(roboto20), black, TextAlign::CENTER, mode_label);
+            it.rectangle(340, row_y + 8, 184, 56, black);
+            it.print(432, row_y + 36, id(roboto24), black, TextAlign::CENTER, mode_label);
           }
 
-          // Setpoint + −/+ buttons (row_y + 58 area)
-          // minus button: x 130–240
-          it.rectangle(130, row_y + 58, 100, 38, black);
-          it.print(180, row_y + 77, id(roboto24), black, TextAlign::CENTER, "-");
-          // setpoint value
+          // Divider between info and button area
+          it.horizontal_line(28, row_y + 106, W - 56, black);
+
+          // Minus button (x 40–190, 80px tall)
+          it.rectangle(40, row_y + 122, 150, 80, black);
+          it.print(115, row_y + 162, id(roboto24), black, TextAlign::CENTER, "-");
+          // Setpoint value (center)
           std::string set_str = fmt_temp_f(set_c);
-          it.print(275, row_y + 77, id(roboto20), black, TextAlign::CENTER, set_str.c_str());
-          // plus button: x 310–420 — shift right so it doesn't overlap mode badge
-          it.rectangle(310, row_y + 58, 100, 38, black);
-          it.print(360, row_y + 77, id(roboto24), black, TextAlign::CENTER, "+");
+          it.print(270, row_y + 162, id(roboto24), black, TextAlign::CENTER, set_str.c_str());
+          // Plus button (x 320–470, 80px tall)
+          it.rectangle(320, row_y + 122, 150, 80, black);
+          it.print(395, row_y + 162, id(roboto24), black, TextAlign::CENTER, "+");
         };
 
-        float cur1   = id(thermo_current_temp).has_state()  ? id(thermo_current_temp).state  : NAN;
-        float set1   = id(thermo_set_temp).has_state()      ? id(thermo_set_temp).state       : NAN;
-        float cur2   = id(thermo_up_current_temp).has_state() ? id(thermo_up_current_temp).state : NAN;
-        float set2   = id(thermo_up_set_temp).has_state()   ? id(thermo_up_set_temp).state    : NAN;
-        std::string mode1   = id(thermo_hvac_mode).has_state()  ? id(thermo_hvac_mode).state  : std::string("");
-        std::string action1 = id(thermo_mode).has_state()       ? id(thermo_mode).state        : std::string("");
+        float cur1   = id(thermo_current_temp).has_state()    ? id(thermo_current_temp).state    : NAN;
+        float set1   = id(thermo_set_temp).has_state()        ? id(thermo_set_temp).state         : NAN;
+        float cur2   = id(thermo_up_current_temp).has_state() ? id(thermo_up_current_temp).state  : NAN;
+        float set2   = id(thermo_up_set_temp).has_state()     ? id(thermo_up_set_temp).state      : NAN;
+        std::string mode1   = id(thermo_hvac_mode).has_state()    ? id(thermo_hvac_mode).state    : std::string("");
+        std::string action1 = id(thermo_mode).has_state()         ? id(thermo_mode).state          : std::string("");
         std::string mode2   = id(thermo_up_hvac_mode).has_state() ? id(thermo_up_hvac_mode).state : std::string("");
-        std::string action2 = id(thermo_up_mode).has_state()    ? id(thermo_up_mode).state     : std::string("");
+        std::string action2 = id(thermo_up_mode).has_state()      ? id(thermo_up_mode).state      : std::string("");
         bool hrv_on = id(hrv_state).has_state() && id(hrv_state).state;
 
+        // Thermo row 1: y=100–320, Thermo row 2: y=336–556, HRV: y=572–692
         draw_thermo_row(100, "Main Thermostat",     cur1, set1, mode1, action1);
-        draw_thermo_row(220, "Upstairs Thermostat", cur2, set2, mode2, action2);
-        draw_row(340, id(img_fan), "HRV", "", hrv_on);
-
-        // ── Temperature sensor grid (y 460–560) ─────────────────────────────
-        struct { const char *name; float val; } temps[4] = {
-          {"Master Bed", id(temp_master_bedroom).has_state() ? id(temp_master_bedroom).state : NAN},
-          {"Ada's Room", id(temp_adas_room).has_state()      ? id(temp_adas_room).state      : NAN},
-          {"Office",     id(temp_office).has_state()         ? id(temp_office).state         : NAN},
-          {"Sun Room",   id(temp_sunroom).has_state()        ? id(temp_sunroom).state        : NAN},
-        };
-        it.horizontal_line(16, 458, W - 32, black);
-        for (int i = 0; i < 4; i++) {
-          int col = i % 2;
-          int row_i = i / 2;
-          int tx_pos = 16 + col * (W / 2);
-          int ty_pos = 468 + row_i * 52;
-          it.print(tx_pos + 8, ty_pos, id(roboto16), black, TextAlign::TOP_LEFT, temps[i].name);
-          std::string tv = fmt_temp_f(temps[i].val);
-          it.print(tx_pos + (W / 2) - 8, ty_pos, id(roboto20), black, TextAlign::TOP_RIGHT, tv.c_str());
-        }
+        draw_thermo_row(336, "Upstairs Thermostat", cur2, set2, mode2, action2);
+        draw_row(572, id(img_fan), "HRV", "", hrv_on);
       }
 
       // ── Room picker overlay ───────────────────────────────────────────────
