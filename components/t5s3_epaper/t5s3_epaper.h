@@ -6,6 +6,7 @@
 #include "esphome/components/display/display_buffer.h"
 
 #include "epdiy.h"
+#include "epd_highlevel.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -52,6 +53,7 @@ class T5S3Epaper : public PollingComponent, public display::DisplayBuffer {
   float bq27220_read_reg(uint8_t reg, bool is_signed);
 
   uint8_t *framebuffer_{nullptr};
+  EpdiyHighlevelState hl_state_{};
   bool initialized_{false};
   bool full_refresh_{true};      // set before xSemaphoreGive; read by flush task
   bool pending_full_refresh_{false};  // latched copy read inside flush task

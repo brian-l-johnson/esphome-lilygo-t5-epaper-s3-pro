@@ -608,11 +608,12 @@ void T5S3Epaper::setup() {
     esp_task_wdt_reset();
   }
 
-  // Framebuffer is 4bpp packed (2 pixels per byte) and must live in PSRAM.
-  int fb_size = epd_width() / 2 * epd_height();
-  this->framebuffer_ = static_cast<uint8_t *>(heap_caps_calloc(fb_size, 1, MALLOC_CAP_SPIRAM));
+  // Highlevel state manages front+back framebuffers in PSRAM and tracks
+  // the current display state for correct DU from→to transitions.
+  this->hl_state_ = epd_hl_init(epd_get_display()->default_waveform);
+  this->framebuffer_ = epd_hl_get_framebuffer(&this->hl_state_);
   if (!this->framebuffer_) {
-    ESP_LOGE(TAG, "Framebuffer allocation failed (%d bytes PSRAM)", fb_size);
+    ESP_LOGE(TAG, "Highlevel framebuffer init failed");
     this->mark_failed();
     return;
   }
@@ -642,26 +643,22 @@ void T5S3Epaper::flush_task_(void *arg) {
     xSemaphoreTake(self->flush_sem_, portMAX_DELAY);
 
     bool do_full = self->pending_full_refresh_;
-    EpdRect area = epd_full_screen();
     uint32_t t0 = millis();
 
     epd_poweron();
     if (do_full) {
-      epd_clear();
-      EpdDrawError err = epd_draw_base(
-          area, self->framebuffer_, area,
-          static_cast<EpdDrawMode>(MODE_GL16 | PREVIOUSLY_WHITE | MODE_PACKING_2PPB),
-          25, nullptr, nullptr, epd_get_display()->default_waveform);
+      // Full clear resets display state and back_fb, then GL16 draws to target.
+      epd_fullclear(&self->hl_state_, 25);
+      EpdDrawError err = epd_hl_update_screen(&self->hl_state_, MODE_GL16, 25);
       if (err != EPD_DRAW_SUCCESS)
-        ESP_LOGE("t5s3_epaper", "epd_draw_base (GL16) failed: 0x%x", err);
+        ESP_LOGE("t5s3_epaper", "epd_hl_update_screen (GL16) failed: 0x%x", err);
       ESP_LOGD("t5s3_epaper", "Full GL16 refresh in %u ms", millis() - t0);
     } else {
-      EpdDrawError err = epd_draw_base(
-          area, self->framebuffer_, area,
-          static_cast<EpdDrawMode>(MODE_DU | PREVIOUSLY_WHITE | MODE_PACKING_2PPB),
-          25, nullptr, nullptr, epd_get_display()->default_waveform);
+      // DU: highlevel API uses back_fb (current display state) for correct
+      // from→to transitions — no PREVIOUSLY_WHITE assumption needed.
+      EpdDrawError err = epd_hl_update_screen(&self->hl_state_, MODE_DU, 25);
       if (err != EPD_DRAW_SUCCESS)
-        ESP_LOGE("t5s3_epaper", "epd_draw_base (DU) failed: 0x%x", err);
+        ESP_LOGE("t5s3_epaper", "epd_hl_update_screen (DU) failed: 0x%x", err);
       ESP_LOGD("t5s3_epaper", "Fast DU refresh in %u ms", millis() - t0);
     }
     epd_poweroff();
