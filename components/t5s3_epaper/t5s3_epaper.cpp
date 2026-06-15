@@ -657,11 +657,15 @@ void T5S3Epaper::flush_task_(void *arg) {
         ESP_LOGE("t5s3_epaper", "epd_hl_update_screen (GL16) failed: 0x%x", err);
       ESP_LOGD("t5s3_epaper", "Full GL16 refresh in %u ms", millis() - t0);
     } else {
-      // DU: highlevel API uses back_fb (current display state) for correct
-      // from→to transitions without any PREVIOUSLY_WHITE assumption.
-      EpdDrawError err = epd_hl_update_screen(&self->hl_state_, MODE_DU, 25);
+      // DU: skip physical rows 0–83 (= portrait top bar y 0–83) to avoid a
+      // triangular white-flash artifact the DU waveform causes on large
+      // unchanged black regions during the physical scan.  The top bar only
+      // changes on room switches, which always use a full GL16 refresh.
+      // With rotation=270°: user y → physical x, so portrait y=84 = physical x=84.
+      EpdRect content = {.x = 84, .y = 0, .width = epd_width() - 84, .height = epd_height()};
+      EpdDrawError err = epd_hl_update_area(&self->hl_state_, MODE_DU, 25, content);
       if (err != EPD_DRAW_SUCCESS)
-        ESP_LOGE("t5s3_epaper", "epd_hl_update_screen (DU) failed: 0x%x", err);
+        ESP_LOGE("t5s3_epaper", "epd_hl_update_area (DU) failed: 0x%x", err);
       ESP_LOGD("t5s3_epaper", "Fast DU refresh in %u ms", millis() - t0);
     }
     epd_poweroff();
