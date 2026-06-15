@@ -66,9 +66,10 @@ globals:
   - id: pending_action
     type: int
     restore_value: false
-    initial_value: '0'   # 0=none 1=office_lights 2=plexamp 3=lr_main 4=lr_upstairs 5=lr_fan
+    initial_value: '0'   # 0=none 1=office_lights 2=plexamp_playpause 3=lr_main 4=lr_upstairs 5=lr_fan
                          # 6=thermo_up 7=thermo_down 8=thermo_up_up 9=thermo_up_down
                          # 10=hrv_toggle 11=thermo_mode_cycle 12=thermo_up_mode_cycle
+                         # 13=plexamp_prev 14=plexamp_next
   - id: show_room_picker
     type: bool
     restore_value: false
@@ -79,12 +80,6 @@ binary_sensor:
   - platform: homeassistant
     id: office_lights_state
     entity_id: light.office_lights
-    internal: true
-    on_state:
-      - lambda: 'if (id(active_room) == 0) id(t5_display).update();'
-  - platform: homeassistant
-    id: plexamp_state
-    entity_id: media_player.plex_plexamp_office
     internal: true
     on_state:
       - lambda: 'if (id(active_room) == 0) id(t5_display).update();'
@@ -183,6 +178,28 @@ sensor:
     lambda: return id(t5_display).get_battery_ma();
 
 text_sensor:
+  # Plexamp / media player
+  - platform: homeassistant
+    id: plexamp_state
+    entity_id: media_player.plex_plexamp_office
+    internal: true
+    on_value:
+      - lambda: 'if (id(active_room) == 0) id(t5_display).update();'
+  - platform: homeassistant
+    id: plexamp_title
+    entity_id: media_player.plex_plexamp_office
+    attribute: media_title
+    internal: true
+    on_value:
+      - lambda: 'if (id(active_room) == 0) id(t5_display).update();'
+  - platform: homeassistant
+    id: plexamp_artist
+    entity_id: media_player.plex_plexamp_office
+    attribute: media_artist
+    internal: true
+    on_value:
+      - lambda: 'if (id(active_room) == 0) id(t5_display).update();'
+  # Thermostat modes
   - platform: homeassistant
     id: thermo_mode
     entity_id: climate.thermostat
@@ -287,8 +304,14 @@ touchscreen:
           int row = (ty - 100) / 120;
 
           if (id(active_room) == 0) {
-            if (row == 0) id(pending_action) = 1;
-            else if (row == 1) id(pending_action) = 2;
+            if (ty < 220) {
+              id(pending_action) = 1;  // Office lights (y 100–220)
+            } else if (ty < 400) {
+              // Plexamp row (y 220–400) — three transport zones
+              if (tx >= 354) id(pending_action) = 14;      // next
+              else if (tx >= 180) id(pending_action) = 2;  // play/pause
+              else id(pending_action) = 13;                // prev
+            }
           } else if (id(active_room) == 1) {
             if (row == 0) id(pending_action) = 3;
             else if (row == 1) id(pending_action) = 4;
@@ -331,6 +354,8 @@ interval:
             case 10: id(toggle_hrv).execute(); break;
             case 11: id(thermo_mode_cycle).execute(); break;
             case 12: id(thermo_up_mode_cycle).execute(); break;
+            case 13: id(plexamp_prev).execute(); break;
+            case 14: id(plexamp_next).execute(); break;
           }
 
 script:
@@ -345,6 +370,18 @@ script:
     then:
       - homeassistant.service:
           service: media_player.media_play_pause
+          data:
+            entity_id: media_player.plex_plexamp_office
+  - id: plexamp_prev
+    then:
+      - homeassistant.service:
+          service: media_player.media_previous_track
+          data:
+            entity_id: media_player.plex_plexamp_office
+  - id: plexamp_next
+    then:
+      - homeassistant.service:
+          service: media_player.media_next_track
           data:
             entity_id: media_player.plex_plexamp_office
   - id: toggle_lr_main
@@ -507,6 +544,10 @@ font:
       - "\U000F066E"  # air-filter (HRV)
       - "\U000F002B"  # arrow-up
       - "\U000F0045"  # arrow-down
+      - "\U000F040A"  # play
+      - "\U000F03E4"  # pause
+      - "\U000F04AD"  # skip-next
+      - "\U000F04AE"  # skip-previous
 
 
 display:
@@ -568,13 +609,58 @@ display:
       };
 
       if (id(active_room) == 0) {
-        bool lights_on  = id(office_lights_state).has_state() && id(office_lights_state).state;
-        bool plexamp_on = id(plexamp_state).has_state() && id(plexamp_state).state;
-
+        bool lights_on = id(office_lights_state).has_state() && id(office_lights_state).state;
         draw_row(100, lights_on ? id(img_bulb_on) : id(img_bulb_off),
                  "Office Lights", "", lights_on);
-        draw_row(220, id(img_music),
-                 "Plexamp", plexamp_on ? "Playing" : "Stopped", plexamp_on);
+
+        // ── Plexamp media row (y 220–400, 180px) ─────────────────────────────
+        {
+          std::string state  = id(plexamp_state).has_state()  ? id(plexamp_state).state  : std::string("off");
+          std::string title  = id(plexamp_title).has_state()  ? id(plexamp_title).state  : std::string("");
+          std::string artist = id(plexamp_artist).has_state() ? id(plexamp_artist).state : std::string("");
+          bool playing = (state == "playing");
+          bool active  = (state == "playing" || state == "paused");
+
+          it.rectangle(16, 220, W - 32, 180, black);
+
+          // Music icon (left, vertically centered in info area)
+          it.image(50, 270, id(img_music), ImageAlign::CENTER, black, white);
+
+          // "Plexamp" label
+          it.print(90, 232, id(roboto20), black, TextAlign::CENTER_LEFT, "Plexamp");
+
+          // Status badge (top-right: x 330–524)
+          const char *state_label = playing ? "PLAYING" : (state == "paused" ? "PAUSED" : "OFF");
+          if (active) {
+            it.filled_rectangle(330, 228, 194, 36, black);
+            it.print(427, 246, id(roboto16), white, TextAlign::CENTER, state_label);
+          } else {
+            it.rectangle(330, 228, 194, 36, black);
+            it.print(427, 246, id(roboto16), black, TextAlign::CENTER, state_label);
+          }
+
+          // Track title + artist (truncate at 36 chars to fit row width)
+          auto trunc = [](const std::string &s) -> std::string {
+            return s.length() > 36 ? s.substr(0, 34) + ".." : s;
+          };
+          if (!title.empty())
+            it.print(90, 264, id(roboto16), black, TextAlign::CENTER_LEFT, trunc(title).c_str());
+          if (!artist.empty())
+            it.print(90, 285, id(roboto16), black, TextAlign::CENTER_LEFT, trunc(artist).c_str());
+
+          // Divider above transport buttons
+          it.horizontal_line(28, 312, W - 56, black);
+
+          // Transport buttons (y 320–390): [⏮ PREV] [⏯ PLAY/PAUSE] [⏭ NEXT]
+          // Three equal zones: x 28–180 / 188–346 / 354–506
+          it.rectangle(28,  320, 152, 70, black);
+          it.rectangle(188, 320, 152, 70, black);
+          it.rectangle(348, 320, 152, 70, black);
+          it.print(104, 355, id(mdi40), black, TextAlign::CENTER, "\U000F04AE");  // skip-previous
+          it.print(264, 355, id(mdi40), black, TextAlign::CENTER,
+                   playing ? "\U000F03E4" : "\U000F040A");                         // pause / play
+          it.print(424, 355, id(mdi40), black, TextAlign::CENTER, "\U000F04AD");  // skip-next
+        }
       } else if (id(active_room) == 1) {
         bool main_on     = id(living_room_main_state).has_state()     && id(living_room_main_state).state;
         bool upstairs_on = id(living_room_upstairs_state).has_state() && id(living_room_upstairs_state).state;
