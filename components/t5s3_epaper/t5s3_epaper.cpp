@@ -631,8 +631,7 @@ void T5S3Epaper::setup() {
       0);                 // core 0 — loopTask runs on core 1, so flush never blocks the main loop
 
   this->initialized_ = true;
-  ESP_LOGCONFIG(TAG, "T5S3Epaper ready (%dx%d, framebuffer=%d bytes PSRAM) [lilygo_board_s3]",
-                epd_width(), epd_height(), fb_size);
+  ESP_LOGCONFIG(TAG, "T5S3Epaper ready (%dx%d) [lilygo_board_s3]", epd_width(), epd_height());
 }
 
 float T5S3Epaper::get_setup_priority() const { return setup_priority::PROCESSOR; }
