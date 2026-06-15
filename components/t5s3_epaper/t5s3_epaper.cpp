@@ -602,7 +602,7 @@ void T5S3Epaper::setup() {
   // epd_init() can take several seconds (LCD peripheral + I2C power sequencing).
   // Only unsubscribe from the task WDT if we're actually subscribed.
   bool wdt_subscribed = (esp_task_wdt_delete(xTaskGetCurrentTaskHandle()) == ESP_OK);
-  epd_init(&epd_board_s3_legacy, &ED047TC1, EPD_LUT_64K);
+  epd_init(&epd_board_s3_legacy, &ED047TC1, EPD_LUT_1K);
   if (wdt_subscribed) {
     esp_task_wdt_add(xTaskGetCurrentTaskHandle());
     esp_task_wdt_reset();
@@ -658,7 +658,7 @@ void T5S3Epaper::flush_task_(void *arg) {
     } else {
       EpdDrawError err = epd_draw_base(
           area, self->framebuffer_, area,
-          static_cast<EpdDrawMode>(MODE_DU | MODE_PACKING_2PPB),
+          static_cast<EpdDrawMode>(MODE_DU | PREVIOUSLY_WHITE | MODE_PACKING_2PPB),
           25, nullptr, nullptr, epd_get_display()->default_waveform);
       if (err != EPD_DRAW_SUCCESS)
         ESP_LOGE("t5s3_epaper", "epd_draw_base (DU) failed: 0x%x", err);
