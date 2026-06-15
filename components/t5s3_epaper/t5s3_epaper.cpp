@@ -646,15 +646,19 @@ void T5S3Epaper::flush_task_(void *arg) {
 
     epd_poweron();
     if (do_full) {
-      // Full clear resets display state and back_fb, then GL16 draws to target.
-      epd_fullclear(&self->hl_state_, 25);
+      // Hardware-clear the display, then tell the highlevel API that back_fb
+      // is now all-white so it computes correct GL16 from→to transitions.
+      // (epd_fullclear() would also wipe front_fb, destroying our render.)
+      epd_clear();
+      int fb_size = epd_width() / 2 * epd_height();
+      memset(self->hl_state_.back_fb, 0xFF, fb_size);
       EpdDrawError err = epd_hl_update_screen(&self->hl_state_, MODE_GL16, 25);
       if (err != EPD_DRAW_SUCCESS)
         ESP_LOGE("t5s3_epaper", "epd_hl_update_screen (GL16) failed: 0x%x", err);
       ESP_LOGD("t5s3_epaper", "Full GL16 refresh in %u ms", millis() - t0);
     } else {
       // DU: highlevel API uses back_fb (current display state) for correct
-      // from→to transitions — no PREVIOUSLY_WHITE assumption needed.
+      // from→to transitions without any PREVIOUSLY_WHITE assumption.
       EpdDrawError err = epd_hl_update_screen(&self->hl_state_, MODE_DU, 25);
       if (err != EPD_DRAW_SUCCESS)
         ESP_LOGE("t5s3_epaper", "epd_hl_update_screen (DU) failed: 0x%x", err);
