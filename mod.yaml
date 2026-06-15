@@ -1,0 +1,800 @@
+esphome:
+  name: lilygo
+  platformio_options:
+    upload_speed: 921600
+    monitor_speed: 115200
+    board_build.flash_size: 16MB
+    board_build.flash_mode: qio
+    board_build.memory_type: qio_opi
+    # epdiy's epd_board_common.c needs esp_adc headers to compile (excluded by ESPHome).
+    # lilygo_board_s3 never calls those ADC functions so they'll be GC'd at link time.
+    build_flags:
+      - "-I/home/bj/.platformio/packages/framework-espidf/components/esp_adc/include"
+      - "-I/home/bj/.platformio/packages/framework-espidf/components/esp_adc/esp32s3/include"
+      - "-DBOARD_HAS_PSRAM"
+
+esp32:
+  variant: esp32s3
+  board: esp32-s3-devkitc-1
+
+  framework:
+    type: esp-idf
+    # The epdiy Frogy76 fork links in the new i2c_master driver (driver_ng) via
+    # lilygo_board_s3.c / epd_board_v7.c etc.  ESP-IDF 5.5.4 has an
+    # __attribute__((constructor)) in the legacy i2c driver that aborts if
+    # driver_ng symbols are present in the binary.  Our board definition uses
+    # the legacy driver (driver/i2c.h), so we skip the conflict check.
+    # The new driver is linked but never initialised at runtime.
+    sdkconfig_options:
+      CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK: "y"
+      CONFIG_SPIRAM: "y"
+      CONFIG_SPIRAM_MODE_OCT: "y"
+      CONFIG_SPIRAM_MEMTEST_ON_INIT: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE_64B: "y"
+
+logger:
+  level: DEBUG
+  # hardware_uart: USB_CDC  # see note about <https://github.com/esphome/feature-requests/issues/1906> above
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_encryption_key
+  on_client_connected:
+    - logger.log: "HA client connected — scheduling full display refresh"
+    - lambda: 'id(t5_display).request_full_refresh();'
+    - component.update: t5_display
+  on_client_disconnected:
+    - logger.log: "HA client disconnected"
+
+ota:
+  platform: esphome
+  password: !secret api_ota_password
+
+wifi: !include wifi-secrets.yaml
+
+globals:
+  - id: active_room
+    type: int
+    restore_value: true
+    initial_value: '0'   # 0 = Office, 1 = Living Room
+  - id: last_touch_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  - id: pending_action
+    type: int
+    restore_value: false
+    initial_value: '0'   # 0=none 1=office_lights 2=plexamp 3=lr_main 4=lr_upstairs 5=lr_fan
+                         # 6=thermo_up 7=thermo_down 8=thermo_up_up 9=thermo_up_down
+                         # 10=hrv_toggle 11=thermo_mode_cycle 12=thermo_up_mode_cycle
+  - id: show_room_picker
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+binary_sensor:
+  # Office
+  - platform: homeassistant
+    id: office_lights_state
+    entity_id: light.office_lights
+    internal: true
+    on_state:
+      - lambda: 'if (id(active_room) == 0) id(t5_display).update();'
+  - platform: homeassistant
+    id: plexamp_state
+    entity_id: media_player.plex_plexamp_office
+    internal: true
+    on_state:
+      - lambda: 'if (id(active_room) == 0) id(t5_display).update();'
+  # Living Room
+  - platform: homeassistant
+    id: living_room_main_state
+    entity_id: light.living_room_main_lights
+    internal: true
+    on_state:
+      - lambda: 'if (id(active_room) == 1) id(t5_display).update();'
+  - platform: homeassistant
+    id: living_room_upstairs_state
+    entity_id: light.upstairs_living_room
+    internal: true
+    on_state:
+      - lambda: 'if (id(active_room) == 1) id(t5_display).update();'
+  - platform: homeassistant
+    id: ceiling_fan_state
+    entity_id: switch.living_room_ceiling_fan
+    internal: true
+    on_state:
+      - lambda: 'if (id(active_room) == 1) id(t5_display).update();'
+  # Climate
+  - platform: homeassistant
+    id: hrv_state
+    entity_id: switch.hrv
+    internal: true
+    on_state:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+
+sensor:
+  # Thermostat — main
+  - platform: homeassistant
+    id: thermo_current_temp
+    entity_id: climate.thermostat
+    attribute: current_temperature
+    internal: true
+    filters:
+      - delta: 0.5
+    on_value:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+  - platform: homeassistant
+    id: thermo_set_temp
+    entity_id: climate.thermostat
+    attribute: temperature
+    internal: true
+    filters:
+      - delta: 0.5
+    on_value:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+  # Thermostat — upstairs
+  - platform: homeassistant
+    id: thermo_up_current_temp
+    entity_id: climate.upstairs_thermostat
+    attribute: current_temperature
+    internal: true
+    filters:
+      - delta: 0.5
+    on_value:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+  - platform: homeassistant
+    id: thermo_up_set_temp
+    entity_id: climate.upstairs_thermostat
+    attribute: temperature
+    internal: true
+    filters:
+      - delta: 0.5
+    on_value:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+  # Room temperature sensors
+  - platform: homeassistant
+    id: temp_master_bedroom
+    entity_id: sensor.atc_f362_temperature
+    internal: true
+    filters:
+      - delta: 0.5
+    on_value:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+  - platform: homeassistant
+    id: temp_adas_room
+    entity_id: sensor.atc_36c2_temperature
+    internal: true
+    filters:
+      - delta: 0.5
+    on_value:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+  - platform: homeassistant
+    id: temp_office
+    entity_id: sensor.office_temperature_sensor_temperature
+    internal: true
+    filters:
+      - delta: 0.5
+    on_value:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+  - platform: homeassistant
+    id: temp_sunroom
+    entity_id: sensor.sunroom_thermometer_temperature
+    internal: true
+    filters:
+      - delta: 0.5
+    on_value:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+
+  - platform: template
+    id: battery_pct
+    name: "Battery Percent"
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    update_interval: 60s
+    lambda: return id(t5_display).get_battery_pct();
+
+  - platform: template
+    id: battery_mv
+    name: "Battery Voltage"
+    unit_of_measurement: "mV"
+    accuracy_decimals: 0
+    device_class: voltage
+    update_interval: 60s
+    lambda: return id(t5_display).get_battery_mv();
+
+  - platform: template
+    id: battery_ma
+    name: "Battery Current"
+    unit_of_measurement: "mA"
+    accuracy_decimals: 0
+    device_class: current
+    update_interval: 60s
+    lambda: return id(t5_display).get_battery_ma();
+
+text_sensor:
+  - platform: homeassistant
+    id: thermo_mode
+    entity_id: climate.thermostat
+    attribute: hvac_action
+    internal: true
+    on_value:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+  - platform: homeassistant
+    id: thermo_hvac_mode
+    entity_id: climate.thermostat
+    internal: true
+    on_value:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+  - platform: homeassistant
+    id: thermo_up_mode
+    entity_id: climate.upstairs_thermostat
+    attribute: hvac_action
+    internal: true
+    on_value:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+  - platform: homeassistant
+    id: thermo_up_hvac_mode
+    entity_id: climate.upstairs_thermostat
+    internal: true
+    on_value:
+      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+  - platform: wifi_info
+    ip_address:
+      name: IP Address
+      id: wifi_ip
+    ssid:
+      name: WiFi SSID
+      id: wifi_ssid
+    bssid:
+      name: WiFi BSSID
+
+# NOTE: The physical button (S3) on this board is wired through the PCA9535
+# GPIO expander (I2C 0x20, pin IO1_2), NOT to a direct GPIO. GPIO21 is SPI
+# MISO and must not be declared as a button. A custom PCA9535 sensor is needed
+# to read it; omitting it for now.
+
+# NOTE: The EPD uses a parallel data bus (GPIO4-8, 15-18, 41, 42, 45, 48).
+# GPIO17 and GPIO18 are EP_D5 / EP_D6 — declaring an SPI bus on them would
+# corrupt the display. The SPI bus for LoRa/SD (GPIO13/14/21) is separate and
+# only needed if you use those peripherals. Removing both from this config.
+
+external_components:
+  - source:
+      type: local
+      path: components/
+    components: ["t5s3_epaper"]
+
+touchscreen:
+  - platform: t5s3_epaper
+    id: t5_touch
+    display: t5_display
+    update_interval: 50ms
+    # GT911 chip axes are swapped relative to the 960x540 display orientation.
+    # Coordinate mapping done manually in on_touch lambda — raw values used directly.
+    on_touch:
+      - lambda: |-
+          // Mapping done in t5s3_touch.cpp — touch.x = screen X (0–540), touch.y = screen Y (0–960)
+          int tx = touch.x;
+          int ty = touch.y;
+          ESP_LOGI("touch", "screen x=%d y=%d", tx, ty);
+
+          // Debounce
+          uint32_t now_ms = millis();
+          if (now_ms - id(last_touch_ms) < 500) return;
+          id(last_touch_ms) = now_ms;
+
+          // ── Room picker overlay (drawn over everything) ───────────────────
+          if (id(show_room_picker)) {
+            // Picker rows start at y=200, each 120px, 3 rooms
+            if (ty >= 200 && ty < 560 && tx >= 40 && tx <= 500) {
+              int picked = (ty - 200) / 120;
+              id(active_room) = picked;
+            }
+            id(show_room_picker) = false;
+            id(t5_display).request_full_refresh();
+            id(t5_display).update();
+            return;
+          }
+
+          // ── Top bar (y 0–80) ─────────────────────────────────────────────
+          if (ty < 80) {
+            if (tx < 420) {
+              // Room name area — open picker
+              id(show_room_picker) = true;
+              id(t5_display).request_full_refresh();
+              id(t5_display).update();
+            } else {
+              // Backlight toggle (right 120px)
+              auto call = id(backlight_light).toggle();
+              call.perform();
+            }
+            return;
+          }
+
+          // ── Control rows (y 100–700, each row 120px tall) ────────────────
+          if (ty < 100 || ty > 700) return;
+          int row = (ty - 100) / 120;
+
+          if (id(active_room) == 0) {
+            if (row == 0) id(pending_action) = 1;
+            else if (row == 1) id(pending_action) = 2;
+          } else if (id(active_room) == 1) {
+            if (row == 0) id(pending_action) = 3;
+            else if (row == 1) id(pending_action) = 4;
+            else if (row == 2) id(pending_action) = 5;
+          } else if (id(active_room) == 2) {
+            // Climate tab — custom hit regions per row
+            // Row 0 (y 100–206): main thermostat
+            //   mode badge: x 350–540  → action 11
+            //   minus btn:  x 130–240  → action 7
+            //   plus btn:   x 260–370  → action 6
+            // Row 1 (y 220–326): upstairs thermostat
+            //   mode badge: x 350–540  → action 12
+            //   minus btn:  x 130–240  → action 9
+            //   plus btn:   x 260–370  → action 8
+            // Row 2 (y 340–446): HRV toggle
+            //   anywhere    → action 10
+            if (row == 0) {
+              if (tx >= 350) id(pending_action) = 11;
+              else if (tx >= 260) id(pending_action) = 6;
+              else if (tx >= 130) id(pending_action) = 7;
+            } else if (row == 1) {
+              if (tx >= 350) id(pending_action) = 12;
+              else if (tx >= 260) id(pending_action) = 8;
+              else if (tx >= 130) id(pending_action) = 9;
+            } else if (row == 2) {
+              id(pending_action) = 10;
+            }
+          }
+
+interval:
+  - interval: 100ms
+    then:
+      - lambda: |-
+          int action = id(pending_action);
+          if (action == 0) return;
+          id(pending_action) = 0;
+          switch (action) {
+            case 1: id(toggle_office_lights).execute(); break;
+            case 2: id(toggle_plexamp).execute(); break;
+            case 3: id(toggle_lr_main).execute(); break;
+            case 4: id(toggle_lr_upstairs).execute(); break;
+            case 5: id(toggle_lr_fan).execute(); break;
+            case 6: id(thermo_setpoint_up).execute(); break;
+            case 7: id(thermo_setpoint_down).execute(); break;
+            case 8: id(thermo_up_setpoint_up).execute(); break;
+            case 9: id(thermo_up_setpoint_down).execute(); break;
+            case 10: id(toggle_hrv).execute(); break;
+            case 11: id(thermo_mode_cycle).execute(); break;
+            case 12: id(thermo_up_mode_cycle).execute(); break;
+          }
+
+script:
+  - id: toggle_office_lights
+    then:
+      - logger.log: "Toggling office lights"
+      - homeassistant.service:
+          service: light.toggle
+          data:
+            entity_id: light.office_lights
+  - id: toggle_plexamp
+    then:
+      - homeassistant.service:
+          service: media_player.media_play_pause
+          data:
+            entity_id: media_player.plex_plexamp_office
+  - id: toggle_lr_main
+    then:
+      - homeassistant.service:
+          service: light.toggle
+          data:
+            entity_id: light.living_room_main_lights
+  - id: toggle_lr_upstairs
+    then:
+      - homeassistant.service:
+          service: light.toggle
+          data:
+            entity_id: light.upstairs_living_room
+  - id: toggle_lr_fan
+    then:
+      - homeassistant.service:
+          service: switch.toggle
+          data:
+            entity_id: switch.living_room_ceiling_fan
+  - id: thermo_setpoint_up
+    then:
+      - homeassistant.service:
+          service: climate.set_temperature
+          data_template:
+            entity_id: climate.thermostat
+            temperature: !lambda "return id(thermo_set_temp).has_state() ? id(thermo_set_temp).state + 1.0f : 20.0f;"
+  - id: thermo_setpoint_down
+    then:
+      - homeassistant.service:
+          service: climate.set_temperature
+          data_template:
+            entity_id: climate.thermostat
+            temperature: !lambda "return id(thermo_set_temp).has_state() ? id(thermo_set_temp).state - 1.0f : 20.0f;"
+  - id: thermo_up_setpoint_up
+    then:
+      - homeassistant.service:
+          service: climate.set_temperature
+          data_template:
+            entity_id: climate.upstairs_thermostat
+            temperature: !lambda "return id(thermo_up_set_temp).has_state() ? id(thermo_up_set_temp).state + 1.0f : 20.0f;"
+  - id: thermo_up_setpoint_down
+    then:
+      - homeassistant.service:
+          service: climate.set_temperature
+          data_template:
+            entity_id: climate.upstairs_thermostat
+            temperature: !lambda "return id(thermo_up_set_temp).has_state() ? id(thermo_up_set_temp).state - 1.0f : 20.0f;"
+  - id: toggle_hrv
+    then:
+      - homeassistant.service:
+          service: switch.toggle
+          data:
+            entity_id: switch.hrv
+  - id: thermo_mode_cycle
+    then:
+      - homeassistant.service:
+          service: climate.set_hvac_mode
+          data_template:
+            entity_id: climate.thermostat
+            hvac_mode: !lambda |-
+              if (!id(thermo_hvac_mode).has_state()) return std::string("heat");
+              std::string m = id(thermo_hvac_mode).state;
+              if (m == "heat") return std::string("cool");
+              if (m == "cool") return std::string("off");
+              return std::string("heat");
+  - id: thermo_up_mode_cycle
+    then:
+      - homeassistant.service:
+          service: climate.set_hvac_mode
+          data_template:
+            entity_id: climate.upstairs_thermostat
+            hvac_mode: !lambda |-
+              if (!id(thermo_up_hvac_mode).has_state()) return std::string("heat");
+              std::string m = id(thermo_up_hvac_mode).state;
+              if (m == "heat") return std::string("cool");
+              if (m == "cool") return std::string("off");
+              return std::string("heat");
+
+output:
+  - platform: gpio
+    pin: GPIO11
+    id: backlight
+
+light:
+  - platform: binary
+    name: Backlight
+    id: backlight_light
+    output: backlight
+    restore_mode: ALWAYS_ON
+
+image:
+  - file: images/lightbulb-on.svg
+    id: img_bulb_on
+    resize: 60x60
+    type: BINARY
+  - file: images/lightbulb-off.svg
+    id: img_bulb_off
+    resize: 60x60
+    type: BINARY
+  - file: images/music.svg
+    id: img_music
+    resize: 60x60
+    type: BINARY
+  - file: images/fan.svg
+    id: img_fan
+    resize: 60x60
+    type: BINARY
+  - file: images/play.svg
+    id: img_play
+    resize: 40x40
+    type: BINARY
+  - file: images/pause.svg
+    id: img_pause
+    resize: 40x40
+    type: BINARY
+
+font:
+  - file: "gfonts://Roboto"
+    id: roboto16
+    size: 16
+
+  - file: "gfonts://Roboto"
+    id: roboto20
+    size: 20
+
+  - file: "gfonts://Roboto"
+    id: roboto24
+    size: 24
+
+  - file: "fonts/materialdesignicons-webfont.ttf"
+    id: mdi40
+    size: 40
+    glyphs:
+      - "\U000F0079"  # battery (100%)
+      - "\U000F007A"  # battery-10
+      - "\U000F007B"  # battery-20
+      - "\U000F007C"  # battery-30
+      - "\U000F007D"  # battery-40
+      - "\U000F007E"  # battery-50
+      - "\U000F007F"  # battery-60
+      - "\U000F0080"  # battery-70
+      - "\U000F0081"  # battery-80
+      - "\U000F0082"  # battery-90
+      - "\U000F0085"  # battery-charging-100
+      - "\U000F0086"  # battery-charging-20
+      - "\U000F0087"  # battery-charging-30
+      - "\U000F0088"  # battery-charging-40
+      - "\U000F0089"  # battery-charging-60
+      - "\U000F008A"  # battery-charging-80
+      - "\U000F008B"  # battery-charging-90
+      - "\U000F0083"  # battery-alert
+      - "\U000F008E"  # battery-outline (0%)
+      - "\U000F05E0"  # check-circle
+      - "\U000F0159"  # close-circle
+      - "\U000F0140"  # chevron-down
+      - "\U000F0143"  # chevron-up
+      - "\U000F0156"  # close
+      - "\U000F050F"  # thermometer
+      - "\U000F066E"  # air-filter (HRV)
+      - "\U000F002B"  # arrow-up
+      - "\U000F0045"  # arrow-down
+
+
+display:
+  - platform: t5s3_epaper
+    id: t5_display
+    rotation: 270
+    update_interval: 5min
+    lambda: |-
+      // Portrait: 540px wide x 960px tall
+      auto black = Color(0, 0, 0);
+      auto white = Color(255, 255, 255);
+      auto gray  = Color(180, 180, 180);
+      const int W = 540;
+
+      it.fill(white);
+
+      // ── Top bar (y 0–80): current room + chevron + backlight ─────────────
+      static const char *room_names[] = {"Office", "Living Room", "Climate"};
+      const char *room_name = room_names[id(active_room)];
+
+      // Room selector button (x 0–420): filled black
+      it.filled_rectangle(0, 0, 420, 80, black);
+      it.print(24, 40, id(roboto24), white, TextAlign::CENTER_LEFT, room_name);
+      it.print(400, 40, id(mdi40), white, TextAlign::CENTER_RIGHT,
+               id(show_room_picker) ? "\U000F0143" : "\U000F0140");  // chevron-up/down
+
+      // Backlight toggle (x 420–540)
+      it.rectangle(420, 0, 120, 80, black);
+      it.print(480, 40, id(roboto24), black, TextAlign::CENTER, "Light");
+
+      // ── Divider ──────────────────────────────────────────────────────────
+      it.horizontal_line(0, 84, W, black);
+
+      // ── Control rows ─────────────────────────────────────────────────────
+      // Each row: 16px margin, 110px tall, icon left, label centre, badge right.
+      auto draw_row = [&](int row_y, esphome::image::Image *icon,
+                          const char *label, const char *sublabel, bool is_on) {
+        Color row_fg = is_on ? white : black;
+        Color row_bg = is_on ? black : white;
+
+        if (is_on)
+          it.filled_rectangle(16, row_y, W - 32, 106, black);
+        else
+          it.rectangle(16, row_y, W - 32, 106, black);
+
+        // Icon — BINARY images support fg/bg color args
+        it.image(50, row_y + 53, icon, ImageAlign::CENTER, row_fg, row_bg);
+
+        // Label
+        it.print(130, row_y + (sublabel[0] ? 30 : 53), id(roboto24), row_fg,
+                 TextAlign::CENTER_LEFT, label);
+        if (sublabel[0])
+          it.print(130, row_y + 66, id(roboto16), row_fg,
+                   TextAlign::CENTER_LEFT, sublabel);
+
+        // ON/OFF badge
+        it.print(W - 26, row_y + 53, id(roboto20), row_fg,
+                 TextAlign::CENTER_RIGHT, is_on ? "ON" : "OFF");
+      };
+
+      if (id(active_room) == 0) {
+        bool lights_on  = id(office_lights_state).has_state() && id(office_lights_state).state;
+        bool plexamp_on = id(plexamp_state).has_state() && id(plexamp_state).state;
+
+        draw_row(100, lights_on ? id(img_bulb_on) : id(img_bulb_off),
+                 "Office Lights", "", lights_on);
+        draw_row(220, id(img_music),
+                 "Plexamp", plexamp_on ? "Playing" : "Stopped", plexamp_on);
+      } else if (id(active_room) == 1) {
+        bool main_on     = id(living_room_main_state).has_state()     && id(living_room_main_state).state;
+        bool upstairs_on = id(living_room_upstairs_state).has_state() && id(living_room_upstairs_state).state;
+        bool fan_on      = id(ceiling_fan_state).has_state()          && id(ceiling_fan_state).state;
+
+        draw_row(100, main_on ? id(img_bulb_on) : id(img_bulb_off),
+                 "Main Lights", "", main_on);
+        draw_row(220, upstairs_on ? id(img_bulb_on) : id(img_bulb_off),
+                 "Upstairs Lights", "", upstairs_on);
+        draw_row(340, id(img_fan), "Ceiling Fan", "", fan_on);
+      } else if (id(active_room) == 2) {
+        // ── Climate tab ──────────────────────────────────────────────────────
+        // HA already reports temperatures in °F — display directly
+        auto fmt_temp_f = [](float f) -> std::string {
+          if (isnan(f)) return std::string("--°F");
+          char buf[12];
+          snprintf(buf, sizeof(buf), "%.0f°F", f);
+          return std::string(buf);
+        };
+
+        // ── draw_thermo_row: thermostat control row ──────────────────────────
+        // row_y: top y of 106px row
+        // label: thermostat name
+        // cur_c, set_c: current/setpoint temps in °C (NaN if unavailable)
+        // hvac_mode: "heat", "cool", "off", "" if unavailable
+        // hvac_action: "heating", "cooling", "idle", "off", ""
+        auto draw_thermo_row = [&](int row_y, const char *label,
+                                   float cur_c, float set_c,
+                                   const std::string &hvac_mode,
+                                   const std::string &hvac_action) {
+          it.rectangle(16, row_y, W - 32, 106, black);
+
+          // Thermometer icon
+          it.print(58, row_y + 53, id(mdi40), black, TextAlign::CENTER, "\U000F050F");
+
+          // Label + current temp
+          it.print(90, row_y + 28, id(roboto20), black, TextAlign::CENTER_LEFT, label);
+          std::string cur_str = fmt_temp_f(cur_c);
+          it.print(90, row_y + 58, id(roboto24), black, TextAlign::CENTER_LEFT, cur_str.c_str());
+
+          // Mode badge (tappable, x 350–540)
+          const char *mode_label = "---";
+          bool active = false;
+          if (hvac_mode == "heat") { mode_label = "HEAT"; active = (hvac_action == "heating"); }
+          else if (hvac_mode == "cool") { mode_label = "COOL"; active = (hvac_action == "cooling"); }
+          else if (hvac_mode == "off")  { mode_label = "OFF";  active = false; }
+          if (active) {
+            it.filled_rectangle(350, row_y + 6, 174, 44, black);
+            it.print(437, row_y + 28, id(roboto20), white, TextAlign::CENTER, mode_label);
+          } else {
+            it.rectangle(350, row_y + 6, 174, 44, black);
+            it.print(437, row_y + 28, id(roboto20), black, TextAlign::CENTER, mode_label);
+          }
+
+          // Setpoint + −/+ buttons (row_y + 58 area)
+          // minus button: x 130–240
+          it.rectangle(130, row_y + 58, 100, 38, black);
+          it.print(180, row_y + 77, id(roboto24), black, TextAlign::CENTER, "-");
+          // setpoint value
+          std::string set_str = fmt_temp_f(set_c);
+          it.print(275, row_y + 77, id(roboto20), black, TextAlign::CENTER, set_str.c_str());
+          // plus button: x 310–420 — shift right so it doesn't overlap mode badge
+          it.rectangle(310, row_y + 58, 100, 38, black);
+          it.print(360, row_y + 77, id(roboto24), black, TextAlign::CENTER, "+");
+        };
+
+        float cur1   = id(thermo_current_temp).has_state()  ? id(thermo_current_temp).state  : NAN;
+        float set1   = id(thermo_set_temp).has_state()      ? id(thermo_set_temp).state       : NAN;
+        float cur2   = id(thermo_up_current_temp).has_state() ? id(thermo_up_current_temp).state : NAN;
+        float set2   = id(thermo_up_set_temp).has_state()   ? id(thermo_up_set_temp).state    : NAN;
+        std::string mode1   = id(thermo_hvac_mode).has_state()  ? id(thermo_hvac_mode).state  : std::string("");
+        std::string action1 = id(thermo_mode).has_state()       ? id(thermo_mode).state        : std::string("");
+        std::string mode2   = id(thermo_up_hvac_mode).has_state() ? id(thermo_up_hvac_mode).state : std::string("");
+        std::string action2 = id(thermo_up_mode).has_state()    ? id(thermo_up_mode).state     : std::string("");
+        bool hrv_on = id(hrv_state).has_state() && id(hrv_state).state;
+
+        draw_thermo_row(100, "Main Thermostat",     cur1, set1, mode1, action1);
+        draw_thermo_row(220, "Upstairs Thermostat", cur2, set2, mode2, action2);
+        draw_row(340, id(img_fan), "HRV", "", hrv_on);
+
+        // ── Temperature sensor grid (y 460–560) ─────────────────────────────
+        struct { const char *name; float val; } temps[4] = {
+          {"Master Bed", id(temp_master_bedroom).has_state() ? id(temp_master_bedroom).state : NAN},
+          {"Ada's Room", id(temp_adas_room).has_state()      ? id(temp_adas_room).state      : NAN},
+          {"Office",     id(temp_office).has_state()         ? id(temp_office).state         : NAN},
+          {"Sun Room",   id(temp_sunroom).has_state()        ? id(temp_sunroom).state        : NAN},
+        };
+        it.horizontal_line(16, 458, W - 32, black);
+        for (int i = 0; i < 4; i++) {
+          int col = i % 2;
+          int row_i = i / 2;
+          int tx_pos = 16 + col * (W / 2);
+          int ty_pos = 468 + row_i * 52;
+          it.print(tx_pos + 8, ty_pos, id(roboto16), black, TextAlign::TOP_LEFT, temps[i].name);
+          std::string tv = fmt_temp_f(temps[i].val);
+          it.print(tx_pos + (W / 2) - 8, ty_pos, id(roboto20), black, TextAlign::TOP_RIGHT, tv.c_str());
+        }
+      }
+
+      // ── Room picker overlay ───────────────────────────────────────────────
+      if (id(show_room_picker)) {
+        // Semi-opaque overlay: white-filled panel with black border (3 rooms = 460px)
+        it.filled_rectangle(30, 160, W - 60, 460, white);
+        it.rectangle(30, 160, W - 60, 460, black);
+        it.rectangle(31, 161, W - 62, 458, black);  // double border
+
+        it.print(W / 2, 185, id(roboto24), black, TextAlign::CENTER, "Select Room");
+        it.horizontal_line(30, 210, W - 60, black);
+
+        // Room rows — y 200 each 120px (matching touch handler)
+        static const char *picker_rooms[] = {"Office", "Living Room", "Climate"};
+        for (int i = 0; i < 3; i++) {
+          int ry = 220 + i * 120;
+          if (i == id(active_room)) {
+            // Highlight current room
+            it.filled_rectangle(32, ry - 2, W - 64, 116, black);
+            it.print(80, ry + 55, id(roboto24), white, TextAlign::CENTER_LEFT, picker_rooms[i]);
+            it.print(W / 2 + 160, ry + 55, id(mdi40), white, TextAlign::CENTER_RIGHT, "\U000F05E0");  // check-circle
+          } else {
+            it.rectangle(32, ry - 2, W - 64, 116, black);
+            it.print(80, ry + 55, id(roboto24), black, TextAlign::CENTER_LEFT, picker_rooms[i]);
+          }
+        }
+
+        // Cancel hint
+        it.print(W / 2, 635, id(roboto16), black, TextAlign::CENTER, "Tap outside to cancel");
+      }
+
+      // ── Bottom info strip ─────────────────────────────────────────────────
+      it.horizontal_line(0, 820, W, black);
+
+      // HA connection status
+      bool ha_connected = global_api_server->is_connected();
+      it.print(16, 820, id(mdi40), black, TextAlign::TOP_LEFT,
+               ha_connected ? "\U000F05E0" : "\U000F0159");
+      it.print(58, 833, id(roboto16), black, TextAlign::TOP_LEFT,
+               ha_connected ? "Home Assistant" : "Disconnected");
+
+      // Battery info
+      {
+        float pct_f = id(t5_display).get_battery_pct();
+        float mv_f  = id(t5_display).get_battery_mv();
+        float ma_f  = id(t5_display).get_battery_ma();
+
+        if (!isnan(pct_f) && pct_f >= 0) {
+          int pct = (int)pct_f;
+          bool charging = !isnan(ma_f) && ma_f > 0;
+
+          // Pick the right MDI battery icon
+          const char *bat_icon;
+          if (charging) {
+            if      (pct >= 90) bat_icon = "\U000F0085";  // charging-100
+            else if (pct >= 70) bat_icon = "\U000F008B";  // charging-90
+            else if (pct >= 55) bat_icon = "\U000F008A";  // charging-80
+            else if (pct >= 45) bat_icon = "\U000F0089";  // charging-60
+            else if (pct >= 35) bat_icon = "\U000F0088";  // charging-40
+            else if (pct >= 25) bat_icon = "\U000F0087";  // charging-30
+            else                bat_icon = "\U000F0086";  // charging-20
+          } else {
+            if      (pct >= 95) bat_icon = "\U000F0079";  // battery (100%)
+            else if (pct >= 85) bat_icon = "\U000F0082";  // battery-90
+            else if (pct >= 75) bat_icon = "\U000F0081";  // battery-80
+            else if (pct >= 65) bat_icon = "\U000F0080";  // battery-70
+            else if (pct >= 55) bat_icon = "\U000F007F";  // battery-60
+            else if (pct >= 45) bat_icon = "\U000F007E";  // battery-50
+            else if (pct >= 35) bat_icon = "\U000F007D";  // battery-40
+            else if (pct >= 25) bat_icon = "\U000F007C";  // battery-30
+            else if (pct >= 15) bat_icon = "\U000F007B";  // battery-20
+            else if (pct >= 5)  bat_icon = "\U000F007A";  // battery-10
+            else                bat_icon = "\U000F0083";  // battery-alert
+          }
+
+          it.print(W - 20, 830, id(mdi40), black, TextAlign::TOP_RIGHT, bat_icon);
+          it.printf(W - 64, 845, id(roboto16), black, TextAlign::TOP_RIGHT, "%d%%", pct);
+
+          if (!isnan(mv_f) && mv_f > 0) {
+            int ma = (int)ma_f;
+            it.printf(W - 20, 868, id(roboto16), black, TextAlign::TOP_RIGHT,
+                      "%.2fV %s%dmA",
+                      mv_f / 1000.0f, ma >= 0 ? "+" : "", ma);
+          }
+        }
+      }

@@ -13,8 +13,6 @@ esphome:
     board_build.psram_type: opi
     board_build.memory_type: qspi_opi
     board_build.boot_freq: 80m
-    platform_packages:
-      - "toolchain-riscv32-esp @8.4.0+2021r2-patch5"
     build_flags:  # the first three defines are required for the screen library to function.
       - "-DBOARD_HAS_PSRAM"
       - "-DARDUINO_RUNNING_CORE=0"  # TODO: this conflicts with the value from platformio's idedata, spewing a lot of warnings during the build.
@@ -31,18 +29,16 @@ esp32:
 
   framework:
     type: arduino
-    # Just like in <https://community.home-assistant.io/t/enable-usb-cdc-to-log-hello-world-to-esp32-s3-dev-board-for-esphome/463164/10>
-    # I had problems with newer versions; the following combination happens to work, so using it for now.
-    version: 2.0.3
-    platform_version: 5.1.1
+    version: recommended  # Arduino 3.x required by ESPHome 2026.4+
 
 logger:
   level: VERBOSE
   # hardware_uart: USB_CDC  # see note about <https://github.com/esphome/feature-requests/issues/1906> above
 
 # Enable Home Assistant API
-api:  # Set up a key instead: https://community.home-assistant.io/t/2023-2-esphome-deprecated-api-password-how-to-update-to-encryption-key
-  password: !secret api_ota_password
+api:
+  encryption:
+    key: !secret api_encryption_key
 
 ota:
   platform: esphome
@@ -50,24 +46,68 @@ ota:
 
 wifi: !include wifi-secrets.yaml
 
-binary_sensor:
-  - platform: gpio
-    pin: 
-      number: GPIO21 #was GPIO39 on the previous board
-      inverted: true
-    name: "Button 1"
-    on_press:
-      - logger.log: PhysButton Pressed
+# NOTE: The physical button (S3) is wired through the PCA9535 GPIO expander
+# (I2C 0x20, pin IO1_2), NOT to a direct GPIO. GPIO21 is SPI MISO.
+
+# NOTE: GPIO17/18 are EPD parallel data lines (EP_D5/EP_D6), not SPI pins.
 
 external_components:
-  source:
-    type: local
-    path: components/
-  components: ["t547"]
+  - source:
+      type: local
+      path: components/
+    components: ["t5s3_epaper"]
+
+time:
+  - platform: homeassistant
+    id: ntp
+
+font:
+  - file: "fonts/arial.ttf"
+    id: my_font
+    size: 40
+  
+  - file: "gfonts://Roboto"
+    id: roboto16
+    size: 16
+
+  - file: "gfonts://Roboto"
+    id: roboto20
+    size: 20
+  
+  - file: "gfonts://Roboto"
+    id: roboto24
+    size: 24
+
+  - file: "gfonts://Roboto"
+    id: roboto40
+    size: 40
+
+  - file: "gfonts://Roboto"
+    id: roboto60
+    size: 60
+
 
 display:
   - platform: t547
-    # rotation: 180
-    update_interval: 30s
+    id: t5_display
+    rotation: 270
+    update_interval: 60s
     lambda: |-
-      it.line(0, 0, 960, 540);
+      #define xres 540 
+      #define yres 960
+      #define x_pad 10 // border padding
+      #define y_pad 10 // border padding      
+      #define cat_pad 85 // padding before category
+      #define val_pad 70 // padding before value
+      #define icon_pad 35 //padding after icons      
+      #define x1n 20 //x position 1st column name
+      #define x1v 25 //x position 1st column value
+      #define x1i 50 //x position 1st column icon
+      #define x2n xres/2 //x position 2nd column name
+      #define x2v xres/2 //x position 2nd column value
+      #define x2i xres/2 //x position 1st column icon
+      
+      int y = 0;
+      
+      // Date
+      it.strftime(xres/2, y+y_pad, id(roboto24), TextAlign::TOP_CENTER, "%A %d/%b/%Y", id(ntp).now());
