@@ -1,0 +1,145 @@
+# Minimal example for the LilyGo T5 E-Paper S3 Pro under ESPHome.
+#
+# This brings the display + touch up with a clock/battery UI and logs every
+# tap. Start here, then grow toward your own integration. See mod.yaml for
+# a full Home Assistant remote-control example (the author's working config).
+#
+# First-time setup:
+#   1. cp secrets.yaml.template     secrets.yaml
+#      cp wifi-secrets.yaml.template wifi-secrets.yaml
+#   2. Edit both files with your WiFi creds, HA API key, OTA password.
+#   3. esphome run example.yaml
+#
+# After flashing, calibrate the touchscreen — see README.md.
+
+esphome:
+  name: lilygo
+  platformio_options:
+    upload_speed: 921600
+    monitor_speed: 115200
+    board_build.flash_size: 16MB
+    board_build.flash_mode: qio
+    board_build.memory_type: qio_opi
+    # epdiy's epd_board_common.c needs esp_adc headers to compile (ESPHome
+    # excludes them). lilygo_board_s3 never calls those ADC functions, so
+    # they'll be GC'd at link time — we just need them to compile.
+    # Adjust the path if your PlatformIO is not at ~/.platformio.
+    build_flags:
+      - "-I${sysenv.HOME}/.platformio/packages/framework-espidf/components/esp_adc/include"
+      - "-I${sysenv.HOME}/.platformio/packages/framework-espidf/components/esp_adc/esp32s3/include"
+      - "-DBOARD_HAS_PSRAM"
+
+esp32:
+  variant: esp32s3
+  board: esp32-s3-devkitc-1
+
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      # Skip the legacy I2C driver conflict check — epdiy's Frogy76 fork
+      # links the new i2c_master driver, but we use the legacy driver at
+      # runtime (the 5.5.x new driver has an ESP_ERR_INVALID_STATE bug).
+      CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK: "y"
+      CONFIG_SPIRAM: "y"
+      CONFIG_SPIRAM_MODE_OCT: "y"
+      CONFIG_SPIRAM_MEMTEST_ON_INIT: "y"
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      # CRITICAL: 64-byte cache line + 80 MHz PSRAM. The IDF default is 32B
+      # + 40 MHz; with those, epdiy's check_cache_configuration() halves the
+      # pixel clock twice, making refreshes ~4× slower.
+      CONFIG_ESP32S3_DATA_CACHE_LINE_32B: n
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_SPIRAM_SPEED_40M: n
+      CONFIG_SPIRAM_SPEED_80M: "y"
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  platform: esphome
+  password: !secret api_ota_password
+
+wifi: !include wifi-secrets.yaml
+
+time:
+  - platform: homeassistant
+    id: ntp
+
+external_components:
+  - source:
+      type: local
+      path: components/
+    components: ["t5s3_epaper"]
+
+font:
+  - file: "gfonts://Roboto"
+    id: roboto20
+    size: 20
+  - file: "gfonts://Roboto"
+    id: roboto24
+    size: 24
+  - file: "gfonts://Roboto"
+    id: roboto60
+    size: 60
+
+# Backlight on/off (held high by default)
+output:
+  - platform: gpio
+    pin: GPIO11
+    id: backlight
+light:
+  - platform: binary
+    name: Backlight
+    id: backlight_light
+    output: backlight
+    restore_mode: ALWAYS_ON
+
+display:
+  - platform: t5s3_epaper
+    id: t5_display
+    rotation: 270   # portrait, 540×960
+    update_interval: 60s
+    lambda: |-
+      auto black = Color(0, 0, 0);
+      auto white = Color(255, 255, 255);
+      it.fill(white);
+
+      // Clock
+      it.strftime(270, 100, id(roboto24), black,
+                  TextAlign::TOP_CENTER, "%A %d %b %Y", id(ntp).now());
+      it.strftime(270, 160, id(roboto60), black,
+                  TextAlign::TOP_CENTER, "%H:%M", id(ntp).now());
+
+      // Battery — uses the cached I2C readings from the component
+      float pct = id(t5_display).get_battery_pct();
+      float mv  = id(t5_display).get_battery_mv();
+      if (!isnan(pct) && pct >= 0) {
+        it.printf(270, 320, id(roboto20), black,
+                  TextAlign::TOP_CENTER, "Battery: %.0f%%  (%.2f V)",
+                  pct, mv / 1000.0f);
+      }
+
+      // Hint
+      it.print(270, 880, id(roboto20), black,
+               TextAlign::TOP_CENTER, "Tap anywhere — see logs");
+
+touchscreen:
+  - platform: t5s3_epaper
+    id: t5_touch
+    display: t5_display
+    update_interval: 50ms
+    # Per-unit calibration. The defaults below worked on the author's
+    # unit; yours may differ. See README.md "Touch calibration" for the
+    # 4-corner procedure to derive your own values.
+    calibration:
+      x_min: 12
+      x_max: 533
+      y_min: 15
+      y_max: 945
+    on_touch:
+      - lambda: |-
+          ESP_LOGI("touch", "tap at (%d, %d)", touch.x, touch.y);
