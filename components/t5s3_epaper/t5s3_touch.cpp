@@ -102,13 +102,16 @@ void T5S3Touch::setup() {
     uint16_t y_max = (uint16_t)(xy[3] << 8 | xy[2]);
     ESP_LOGI(TAG, "GT911 raw max coords from chip: x=%d y=%d", x_max, y_max);
   }
-  // We map chip coords to screen pixels ourselves in update_touches().
-  // Set raw max = display size so ESPHome's normalization is a 1:1 pass-through
-  // (normalize_ maps 0..max → 0..0xFFF, then back to 0..display_size).
+  // We hand the base class already-mapped display-space coords (see
+  // update_touches), and want its normalize_/scale step to be an identity.
+  // Setting raw_max = display_size makes normalize_(val=display_size) hit
+  // the >= max_val branch returning 0xFFF, which then scales back to
+  // display_size - 1 exactly. Any value in between round-trips with at
+  // most ±1 px rounding.
   this->x_raw_min_ = 0;
-  this->x_raw_max_ = 539;
+  this->x_raw_max_ = 540;
   this->y_raw_min_ = 0;
-  this->y_raw_max_ = 959;
+  this->y_raw_max_ = 960;
 
   // GPIO38 is shared between PCA9535 INT and GT911 INT — using it as an
   // interrupt source causes conflicts with the board init ISR handler.
@@ -148,16 +151,23 @@ void T5S3Touch::update_touches() {
     return;
   }
 
-  // Clear the status register before reading points so we don't re-process.
-  this->gt911_write_(GT911_STATUS_REG, 0x00);
-
-  if (num_touches == 0) return;  // finger lifted — base class handles release
+  if (num_touches == 0) {
+    // Finger lifted — base class handles release. Clear status so the chip
+    // can report the next touch.
+    this->gt911_write_(GT911_STATUS_REG, 0x00);
+    return;
+  }
 
   uint8_t points[GT911_MAX_TOUCHES * GT911_TOUCH_BYTES] = {};
   if (!this->gt911_read_(GT911_TOUCH0_REG, points, num_touches * GT911_TOUCH_BYTES)) {
     this->skip_update_ = true;
     return;
   }
+
+  // Clear status AFTER reading the points — otherwise the chip can latch a
+  // new sample in the gap between our clear and our read, and we'd see
+  // half-updated point data.
+  this->gt911_write_(GT911_STATUS_REG, 0x00);
 
   for (uint8_t i = 0; i < num_touches; i++) {
     const uint8_t *p = points + i * GT911_TOUCH_BYTES;
@@ -166,11 +176,9 @@ void T5S3Touch::update_touches() {
     uint16_t raw_y = (uint16_t)(p[4] << 8 | p[3]);
 
     // Map chip coords to screen pixel coords for rotation=270, portrait 540x960.
-    // Calibration from 4-corner taps:
-    //   raw_x left≈100, right≈460  → screen X 0–540
-    //   raw_y top≈63,   bottom≈825 → screen Y 0–960
-    int screen_x = ((int)raw_x - 100) * 540 / (460 - 100);
-    int screen_y = ((int)raw_y - 63)  * 960 / (825 - 63);
+    // Calibration constants are configurable via YAML — see set_cal_raw_*.
+    int screen_x = ((int)raw_x - cal_raw_x_min_) * 540 / (cal_raw_x_max_ - cal_raw_x_min_);
+    int screen_y = ((int)raw_y - cal_raw_y_min_) * 960 / (cal_raw_y_max_ - cal_raw_y_min_);
     screen_x = std::max(0, std::min(539, screen_x));
     screen_y = std::max(0, std::min(959, screen_y));
 

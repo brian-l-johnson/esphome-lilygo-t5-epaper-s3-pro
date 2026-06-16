@@ -174,14 +174,23 @@ static uint8_t s3_tps_read(uint8_t reg)
 static void s3_tps_set_vcom(unsigned vcom_mv)
 {
     unsigned val = vcom_mv / 10;
-    ESP_ERROR_CHECK(s3_tps_write(S3_TPS_VCOM2, (val & 0x100u) >> 8));
-    ESP_ERROR_CHECK(s3_tps_write(S3_TPS_VCOM1,  val & 0xFFu));
+    esp_err_t r1 = s3_tps_write(S3_TPS_VCOM2, (val & 0x100u) >> 8);
+    esp_err_t r2 = s3_tps_write(S3_TPS_VCOM1,  val & 0xFFu);
+    if (r1 != ESP_OK || r2 != ESP_OK)
+        ESP_LOGW("epdiy", "TPS VCOM write failed: %s / %s",
+                 esp_err_to_name(r1), esp_err_to_name(r2));
 }
 
 /* ── Board callbacks ──────────────────────────────────────────────────────── */
 
 static void s3_board_init(uint32_t epd_row_width)
 {
+#ifdef T5S3_HW_DIAG
+    /* ── HW-FAILURE DIAGNOSTICS (build with -DT5S3_HW_DIAG to enable) ───────
+     * These probes were written to debug unit #1's dead VDD0V3 rail. On
+     * working hardware they cost ~6 s of boot time without changing behavior.
+     * Re-enable by adding `-DT5S3_HW_DIAG` to mod.yaml's build_flags. */
+
     /* ── Pre-step: log key hardware registers, then wait for VDD0V3 to stabilize.
      *
      * Root-cause hypothesis: VDD0V3 (ME6217 LDO output) powers the I2C pull-up
@@ -302,6 +311,7 @@ static void s3_board_init(uint32_t epd_row_width)
         ESP_LOGE("epdiy", "VDD0V3 / I2C lines did not come up within 5 s — "
                  "hardware power issue (check BQ25896/ME6217)");
     }
+#endif  /* T5S3_HW_DIAG */
 
     /* ── Step 0: delete any pre-existing I2C driver to reset the peripheral.
      * After an OTA soft-reset the previous firmware's I2C driver (and any
@@ -449,14 +459,17 @@ static void s3_board_init(uint32_t epd_row_width)
     }
     s3_i2c_ok = true;
     /* Port 0: all outputs. */
-    ESP_ERROR_CHECK(s3_pca_write(S3_PCA_CFG0, 0x00));
+    if (esp_err_t r = s3_pca_write(S3_PCA_CFG0, 0x00); r != ESP_OK)
+        ESP_LOGW("epdiy", "PCA9535 CFG0 write failed: %s", esp_err_to_name(r));
     /* Set port-0 outputs high (safe/inactive state). */
-    ESP_ERROR_CHECK(s3_pca_write(S3_PCA_OUT0, 0xFF));
+    if (esp_err_t r = s3_pca_write(S3_PCA_OUT0, 0xFF); r != ESP_OK)
+        ESP_LOGW("epdiy", "PCA9535 OUT0 write failed: %s", esp_err_to_name(r));
 
     const EpdDisplay_t *display = epd_get_display();
     LcdEpdConfig_t lcd_cfg = {
-        // 8 MHz: safe for 32B DMA cache lines; check_cache_configuration() is
-        // patched to not halve the clock so this value is used as-is.
+        // 8 MHz pixel clock. epdiy's check_cache_configuration() will halve
+        // this twice if the data cache line size is < 64B (default IDF is
+        // 32B), so mod.yaml must set CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y.
         .pixel_clock      = 8000000u,
         .ckv_high_time    = 60,
         .line_front_porch = 4,
@@ -527,7 +540,10 @@ static void s3_board_poweron(epd_ctrl_state_t *state)
     vTaskDelay(1);
     while (!(s3_pca_read(S3_PCA_IN1) & S3_PIN_PWRGOOD)) {}
 
-    ESP_ERROR_CHECK(s3_tps_write(S3_TPS_ENABLE, 0x3F));
+    if (esp_err_t r = s3_tps_write(S3_TPS_ENABLE, 0x3F); r != ESP_OK) {
+        ESP_LOGE("epdiy", "TPS ENABLE write failed: %s — aborting poweron", esp_err_to_name(r));
+        return;
+    }
     s3_tps_set_vcom(s3_vcom);
 
     state->ep_sth = true;
@@ -591,14 +607,6 @@ static const char *const TAG = "t5s3_epaper";
 void T5S3Epaper::setup() {
   ESP_LOGCONFIG(TAG, "Setting up T5 E-Paper S3 Pro...");
 
-  // Sentinel so ESPHome's null-guards don't trip.
-  this->buffer_ = static_cast<uint8_t *>(malloc(1));
-  if (!this->buffer_) {
-    ESP_LOGE(TAG, "Sentinel buffer allocation failed");
-    this->mark_failed();
-    return;
-  }
-
   // epd_init() can take several seconds (LCD peripheral + I2C power sequencing).
   // Only unsubscribe from the task WDT if we're actually subscribed.
   bool wdt_subscribed = (esp_task_wdt_delete(xTaskGetCurrentTaskHandle()) == ESP_OK);
@@ -620,6 +628,10 @@ void T5S3Epaper::setup() {
 
   this->flush_sem_ = xSemaphoreCreateBinary();
   this->done_sem_  = xSemaphoreCreateBinary();
+  // Binary semaphores start in the "taken" state. Give done_sem_ once so the
+  // first update() can take it and proceed; subsequent gives come from the
+  // flush task when each refresh completes.
+  xSemaphoreGive(this->done_sem_);
 
   xTaskCreatePinnedToCore(
       T5S3Epaper::flush_task_,
@@ -644,6 +656,11 @@ void T5S3Epaper::flush_task_(void *arg) {
     bool do_full = self->pending_full_refresh_;
     uint32_t t0 = millis();
 
+    // epd_poweron / epd_poweroff bracket every refresh: the TPS65185 drives
+    // the panel's positive/negative gate-drive rails and VCOM. Leaving it on
+    // between refreshes would save ~50-200 ms of TPS sequencing per refresh
+    // but burn ~30 mA continuously — bad for battery life. Acceptable today;
+    // revisit if the perceived latency becomes the bottleneck again.
     epd_poweron();
     if (do_full) {
       // Hardware-clear the display, then tell the highlevel API that back_fb
@@ -657,15 +674,24 @@ void T5S3Epaper::flush_task_(void *arg) {
         ESP_LOGE("t5s3_epaper", "epd_hl_update_screen (GL16) failed: 0x%x", err);
       ESP_LOGD("t5s3_epaper", "Full GL16 refresh in %u ms", millis() - t0);
     } else {
-      // DU: skip physical rows 0–83 (= portrait top bar y 0–83) to avoid a
-      // triangular white-flash artifact the DU waveform causes on large
-      // unchanged black regions during the physical scan.  The top bar only
-      // changes on room switches, which always use a full GL16 refresh.
-      // With rotation=270°: user y → physical x, so portrait y=84 = physical x=84.
-      EpdRect content = {.x = 84, .y = 0, .width = epd_width() - 84, .height = epd_height()};
-      EpdDrawError err = epd_hl_update_area(&self->hl_state_, MODE_DU, 25, content);
+      // DU update.  The DU waveform's common-electrode swings affect ALL pixels
+      // globally, even those outside the update area.  For B→B pixels (unchanged
+      // solid-black room selector) the per-pixel drive is zero, so the COM swing
+      // goes uncompensated and drifts them white — the triangle artifact.
+      //
+      // Fix: mark top-bar columns (physical x 0–83 = portrait y 0–83) as "white"
+      // in back_fb before the waveform runs.  epdiy then computes W→target for
+      // every top-bar pixel and fires an active per-pixel drive (W→B for the room
+      // selector, W→W no-op for white areas).  The strong W→B drive overcomes the
+      // COM drift.  Run full-display DU so the per-pixel data actually fires.
+      {
+        const int stride = epd_width() / 2;  // 480 bytes/row (4 bpp, 2 px/byte)
+        for (int r = 0; r < epd_height(); r++)
+          memset(self->hl_state_.back_fb + r * stride, 0xFF, 84 / 2);
+      }
+      EpdDrawError err = epd_hl_update_screen(&self->hl_state_, MODE_DU, 25);
       if (err != EPD_DRAW_SUCCESS)
-        ESP_LOGE("t5s3_epaper", "epd_hl_update_area (DU) failed: 0x%x", err);
+        ESP_LOGE("t5s3_epaper", "epd_hl_update_screen (DU) failed: 0x%x", err);
       ESP_LOGD("t5s3_epaper", "Fast DU refresh in %u ms", millis() - t0);
     }
     epd_poweroff();
@@ -677,20 +703,69 @@ void T5S3Epaper::flush_task_(void *arg) {
 void T5S3Epaper::update() {
   if (!initialized_) return;
 
-  // Render the framebuffer on the main loop (fast — just pixel writes).
+  // Serialize with the flush task: it reads front_fb in epd_hl_update_screen
+  // while we'd be writing to it in do_update_(). done_sem_ is given by the
+  // flush task at the end of each refresh (and once at setup so the first
+  // render proceeds). If we can't take it, a flush is in flight — flag for
+  // retry in loop() so we don't drop the latest state.
+  if (xSemaphoreTake(this->done_sem_, 0) == pdFALSE) {
+    needs_update_ = true;
+    return;
+  }
+
+  uint32_t t0 = millis();
   this->do_update_();
+  uint32_t render_ms = millis() - t0;
   this->display();
+  if (render_ms > 100)
+    ESP_LOGI(TAG, "lambda render: %u ms", render_ms);
+}
+
+void T5S3Epaper::loop() {
+  // Coalesce request_refresh() bursts: wait REFRESH_COALESCE_MS after the
+  // most recent request before firing. A burst of HA state changes collapses
+  // to a single render instead of one per event.
+  if (dirty_ && (millis() - dirty_at_ms_) >= REFRESH_COALESCE_MS &&
+      xSemaphoreTake(this->done_sem_, 0) == pdTRUE) {
+    dirty_ = false;
+    needs_update_ = false;  // a fresh render satisfies any deferred update() too
+    uint32_t t0 = millis();
+    this->do_update_();
+    uint32_t render_ms = millis() - t0;
+    this->display();
+    if (render_ms > 100)
+      ESP_LOGI(TAG, "lambda render (dirty): %u ms", render_ms);
+    return;
+  }
+
+  // Retry path for update() that was deferred while a flush was in flight.
+  if (needs_update_ && xSemaphoreTake(this->done_sem_, 0) == pdTRUE) {
+    needs_update_ = false;
+    uint32_t t0 = millis();
+    this->do_update_();
+    uint32_t render_ms = millis() - t0;
+    this->display();
+    if (render_ms > 100)
+      ESP_LOGI(TAG, "lambda render (deferred): %u ms", render_ms);
+  }
 }
 
 void T5S3Epaper::display() {
   if (!initialized_) return;
 
   // Auto-promote to full refresh every FULL_REFRESH_EVERY fast updates
-  // to clear accumulated DU ghosting.
+  // to clear accumulated DU ghosting. Defer the promotion if the user
+  // touched the screen recently — a 1.8 s GL16 mid-interaction is jarring.
   if (!full_refresh_) {
-    if (++fast_refresh_count_ >= FULL_REFRESH_EVERY) {
-      full_refresh_ = true;
-      fast_refresh_count_ = 0;
+    if (fast_refresh_count_ < FULL_REFRESH_EVERY) fast_refresh_count_++;
+    if (fast_refresh_count_ >= FULL_REFRESH_EVERY) {
+      bool touch_recent = (millis() - last_touch_at_ms_) < TOUCH_FULL_REFRESH_HOLDOFF_MS;
+      if (!touch_recent) {
+        full_refresh_ = true;
+        fast_refresh_count_ = 0;
+      }
+      // Otherwise: counter stays pinned and the next refresh after touch
+      // settles will promote to GL16 to clear the accumulated ghosting.
     }
   } else {
     fast_refresh_count_ = 0;
@@ -714,7 +789,108 @@ void HOT T5S3Epaper::draw_absolute_pixel_internal(int x, int y, Color color) {
        static_cast<uint16_t>(color.green) * 150u +
        static_cast<uint16_t>(color.blue)  * 30u) >> 8u);
 
-  epd_draw_pixel(x, y, luma, this->framebuffer_);
+  // Inline epd_draw_pixel — drops a function call per pixel. Glyph
+  // rasterization issues hundreds of thousands of these per render.
+  uint8_t *p = this->framebuffer_ + (y * 480) + (x >> 1);
+  if (x & 1)
+    *p = (*p & 0x0F) | (luma & 0xF0);
+  else
+    *p = (*p & 0xF0) | (luma >> 4);
+}
+
+void T5S3Epaper::fill(Color color) {
+  // Full-screen solid fill via memset — bypasses the 500K-call pixel loop
+  // and the rotation transform that turns it into a column-traversal cache
+  // thrash. Called by ESPHome's it.fill() and our overridden clear().
+  if (!this->framebuffer_) return;
+  uint8_t luma = static_cast<uint8_t>(
+      (static_cast<uint16_t>(color.red)   * 76u +
+       static_cast<uint16_t>(color.green) * 150u +
+       static_cast<uint16_t>(color.blue)  * 30u) >> 8u);
+  uint8_t nibble = luma >> 4;       // 4bpp packed: top 4 bits of luma
+  uint8_t byte = (nibble << 4) | nibble;
+  memset(this->framebuffer_, byte, 960 * 540 / 2);
+}
+
+void HOT T5S3Epaper::draw_pixel_at(int x, int y, Color color) {
+  // Direct override that skips DisplayBuffer::draw_pixel_at's clipping check
+  // and virtual call to draw_absolute_pixel_internal. Lambda is in rotated
+  // 540×960 portrait space; physical framebuffer is 960×540 landscape.
+  // Rotation 270 mapping: px = ly, py = 539 - lx.
+  int px = y;
+  int py = 539 - x;
+  if (px < 0 || px >= 960 || py < 0 || py >= 540) return;
+  uint8_t luma = static_cast<uint8_t>(
+      (static_cast<uint16_t>(color.red)   * 76u +
+       static_cast<uint16_t>(color.green) * 150u +
+       static_cast<uint16_t>(color.blue)  * 30u) >> 8u);
+  uint8_t *p = this->framebuffer_ + (py * 480) + (px >> 1);
+  if (px & 1)
+    *p = (*p & 0x0F) | (luma & 0xF0);
+  else
+    *p = (*p & 0xF0) | (luma >> 4);
+}
+
+void T5S3Epaper::fast_rect(int x, int y, int w, int h, Color color) {
+  // Lambda's logical rect (540×960 portrait) → physical (960×540 landscape).
+  // Rotation 270: (lx, ly) → (px, py) = (ly, 539 - lx).
+  // Logical rect [x, x+w) × [y, y+h) maps to physical:
+  //   px ∈ [y, y+h)
+  //   py ∈ [539-(x+w-1), 540-x)  = [540-x-w, 540-x)
+  if (!this->framebuffer_ || w <= 0 || h <= 0) return;
+  int px_start = y;
+  int px_end   = y + h;
+  int py_start = 540 - x - w;
+  int py_end   = 540 - x;
+  if (px_start < 0) px_start = 0;
+  if (px_end > 960) px_end = 960;
+  if (py_start < 0) py_start = 0;
+  if (py_end > 540) py_end = 540;
+  if (px_start >= px_end || py_start >= py_end) return;
+
+  uint8_t luma = static_cast<uint8_t>(
+      (static_cast<uint16_t>(color.red)   * 76u +
+       static_cast<uint16_t>(color.green) * 150u +
+       static_cast<uint16_t>(color.blue)  * 30u) >> 8u);
+  uint8_t nibble = luma >> 4;
+  uint8_t solid = (nibble << 4) | nibble;
+  uint8_t hi_nibble = nibble << 4;  // (luma & 0xF0)
+  uint8_t lo_nibble = nibble;        // (luma >> 4)
+
+  for (int py = py_start; py < py_end; py++) {
+    uint8_t *row = this->framebuffer_ + py * 480;
+    int px = px_start;
+    // Odd start — one nibble of one byte.
+    if (px & 1) {
+      uint8_t *pp = row + (px >> 1);
+      *pp = (*pp & 0x0F) | hi_nibble;
+      px++;
+    }
+    // Aligned middle — memset full bytes.
+    int byte_start = px >> 1;
+    int byte_end   = px_end >> 1;
+    if (byte_end > byte_start) {
+      memset(row + byte_start, solid, byte_end - byte_start);
+      px = byte_end << 1;
+    }
+    // Odd end — one nibble of one byte.
+    if (px < px_end) {
+      uint8_t *pp = row + (px >> 1);
+      *pp = (*pp & 0xF0) | lo_nibble;
+    }
+  }
+}
+
+void T5S3Epaper::refresh_battery_() {
+  uint32_t now = millis();
+  // Force a read on first call (last_read_ms_=0 + cache=NAN); after that,
+  // throttle so the display lambda's three calls per render collapse to one.
+  if (battery_last_read_ms_ != 0 && (now - battery_last_read_ms_) < BATTERY_CACHE_MS)
+    return;
+  cached_battery_pct_ = bq27220_read_reg(0x2C, false);
+  cached_battery_mv_  = bq27220_read_reg(0x08, false);
+  cached_battery_ma_  = bq27220_read_reg(0x14, true);
+  battery_last_read_ms_ = now;
 }
 
 float T5S3Epaper::bq27220_read_reg(uint8_t reg, bool is_signed) {

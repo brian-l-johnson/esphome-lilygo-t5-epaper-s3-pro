@@ -1,47 +1,64 @@
-This repository contains a Display component for [ESPHome](https://esphome.io/)
-to support the ESP32-S3 [LILYGO T5 4.7" Plus E-paper display](https://www.lilygo.cc/products/t5-4-7-inch-e-paper-v2-3).
+# ESPHome — LilyGo T5 E-Paper S3 Pro
 
-(Do not confuse it with the original ESP32-based Lilygo T5 4.7 board.)
+ESPHome custom component for the [LilyGo T5 4.7" E-Paper S3 Pro](https://www.lilygo.cc/)
+(ESP32-S3, ED047TC1 4.7" 960×540 e-paper, GT911 touch, TPS65185 PMIC,
+PCA9535 GPIO expander, BQ27220 fuel gauge, BQ25896 charger).
 
-For more info in the display components, see the [ESPHome display documentation](https://esphome.io/#display-components)
+This is a fork of [nickolay/esphome-lilygo-t547plus](https://github.com/nickolay/esphome-lilygo-t547plus)
+rewritten for the S3 Pro hardware. The original supported the
+T5 4.7" v2.3 (ESP32, not S3) under a different component name.
 
-## Usage
+> **Not for the original T5 4.7"** — different MCU, different I2C/GPIO map,
+> different power sequencing. Use the upstream repo if you have that board.
 
-To use the board with [ESPHome](https://esphome.io/) **you have to put quite a
-number of options in your esphome config**:
-* Configure the aprpopriate board, variant, and framework versions in the
-[esp32 platform](https://esphome.io/components/esp32.html)
-* Set a bunch of `platformio_options`
-* Include the component from this repository as `external_components` 
+## Build
 
-If you clone this repository, a working example is included:
-
-    git clone https://github.com/nickolay/esphome-lilygo-t547plus.git
-    cd esphome-lilygo-t547plus
-    esphome run basic.yaml
-
-If you don't want to clone, copy the necessary pieces from [basic.yaml](./basic.yaml)
-and adapt the `external_components` configuration as follows:
-
-```yaml
-# ... required esp32, platformio_options configuration omitted for brevity ...
-
-external_components:
-  - source: github://nickolay/esphome-lilygo-t547plus
-    components: ["t547"]
-
-## for those using ESPHome 2023.6.5 and earlier:
-# external_components:
-#   - source: github://nickolay/esphome-lilygo-t547plus@2023.6.5
-#     components: [t547]
-
-
-display:
-- platform: t547
-  id: t5_display
-  update_interval: 30s
+```sh
+git clone https://github.com/nickolay/esphome-lilygo-t547plus.git
+cd esphome-lilygo-t547plus
+esphome run mod.yaml
 ```
 
-## Discussion
+Requires:
+- ESPHome ≥ 2023.12 (tested on 2026.4.5)
+- PlatformIO with the `pioarduino` platform (ESP-IDF 5.5.x)
 
-https://github.com/esphome/feature-requests/issues/1960
+`mod.yaml` is a working example that drives a Home Assistant remote-control
+UI (rooms, lights, climate, media). Adapt the `display:` lambda for your own
+use case.
+
+## Component
+
+```yaml
+external_components:
+  - source:
+      type: local
+      path: components/
+    components: ["t5s3_epaper"]
+
+display:
+  - platform: t5s3_epaper
+    id: t5_display
+    rotation: 270
+    update_interval: 60s
+    lambda: |-
+      it.fill(Color(255, 255, 255));
+      # ... your draw code ...
+
+touchscreen:
+  - platform: t5s3_epaper
+    id: t5_touch
+    display: t5_display
+    update_interval: 50ms
+    on_touch:
+      - lambda: |-
+          ESP_LOGI("touch", "x=%d y=%d", touch.x, touch.y);
+```
+
+## Notes
+
+- Uses [Frogy76/epdiy](https://github.com/Frogy76/epdiy) (ESP-IDF 5.5.x compatible).
+- Board init uses the **legacy** I2C driver (`driver/i2c.h`); the new
+  `i2c_master` driver in ESP-IDF 5.5.4 has an `ESP_ERR_INVALID_STATE` bug.
+- E-paper refresh runs on a FreeRTOS task pinned to core 0 so the main loop
+  and HA API stay responsive during the ~100 ms DU / ~1.5 s GL16 waveforms.

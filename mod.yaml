@@ -29,12 +29,26 @@ esp32:
       CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK: "y"
       CONFIG_SPIRAM: "y"
       CONFIG_SPIRAM_MODE_OCT: "y"
+      # OCT PSRAM on this board (APS6408) supports 80 MHz. The IDF default
+      # is 40 MHz, which halves the throughput of every framebuffer write —
+      # the YAML render lambda dropped from ~2 s to expected ~500 ms with 80M.
+      CONFIG_SPIRAM_SPEED_40M: n
+      CONFIG_SPIRAM_SPEED_80M: "y"
       CONFIG_SPIRAM_MEMTEST_ON_INIT: "y"
       CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
-      CONFIG_ESP32S3_DATA_CACHE_LINE_SIZE_64B: "y"
+      # epdiy's check_cache_configuration() halves the pixel clock when the
+      # data cache line size is < 64B — and it's called twice during init, so
+      # the wrong setting drops 8 MHz → 2 MHz (a 4× refresh slowdown).
+      # The IDF default on this variant is 32B; both options below are needed
+      # to actually flip the choice group.
+      CONFIG_ESP32S3_DATA_CACHE_LINE_32B: n
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
 
 logger:
-  level: DEBUG
+  # DEBUG fires many lines per refresh + per touch; over USB-CDC the buffer
+  # can back-pressure the main thread and add 1-2 s to renders. INFO keeps
+  # the touch / climate / warning lines we actually use.
+  level: INFO
   # hardware_uart: USB_CDC  # see note about <https://github.com/esphome/feature-requests/issues/1906> above
 
 # Enable Home Assistant API
@@ -47,6 +61,7 @@ api:
     - component.update: t5_display
   on_client_disconnected:
     - logger.log: "HA client disconnected"
+    - lambda: 'id(t5_display).request_refresh();'
 
 ota:
   platform: esphome
@@ -63,13 +78,6 @@ globals:
     type: uint32_t
     restore_value: false
     initial_value: '0'
-  - id: pending_action
-    type: int
-    restore_value: false
-    initial_value: '0'   # 0=none 1=office_lights 2=plexamp_playpause 3=lr_main 4=lr_upstairs 5=lr_fan
-                         # 6=thermo_up 7=thermo_down 8=thermo_up_up 9=thermo_up_down
-                         # 10=hrv_toggle 11=thermo_mode_cycle 12=thermo_up_mode_cycle
-                         # 13=plexamp_prev 14=plexamp_next
   - id: show_room_picker
     type: bool
     restore_value: false
@@ -82,33 +90,43 @@ binary_sensor:
     entity_id: light.office_lights
     internal: true
     on_state:
-      - lambda: 'if (id(active_room) == 0) id(t5_display).update();'
+      - lambda: |-
+          id(t5_display).clear_optimistic(0);
+          if (id(active_room) == 0) id(t5_display).request_refresh();
   # Living Room
   - platform: homeassistant
     id: living_room_main_state
     entity_id: light.living_room_main_lights
     internal: true
     on_state:
-      - lambda: 'if (id(active_room) == 1) id(t5_display).update();'
+      - lambda: |-
+          id(t5_display).clear_optimistic(1);
+          if (id(active_room) == 1) id(t5_display).request_refresh();
   - platform: homeassistant
     id: living_room_upstairs_state
     entity_id: light.upstairs_living_room
     internal: true
     on_state:
-      - lambda: 'if (id(active_room) == 1) id(t5_display).update();'
+      - lambda: |-
+          id(t5_display).clear_optimistic(2);
+          if (id(active_room) == 1) id(t5_display).request_refresh();
   - platform: homeassistant
     id: ceiling_fan_state
     entity_id: switch.living_room_ceiling_fan
     internal: true
     on_state:
-      - lambda: 'if (id(active_room) == 1) id(t5_display).update();'
+      - lambda: |-
+          id(t5_display).clear_optimistic(3);
+          if (id(active_room) == 1) id(t5_display).request_refresh();
   # Climate
   - platform: homeassistant
     id: hrv_state
     entity_id: switch.hrv
     internal: true
     on_state:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+      - lambda: |-
+          id(t5_display).clear_optimistic(4);
+          if (id(active_room) == 2) id(t5_display).request_refresh();
 
 sensor:
   # Thermostat — main
@@ -120,7 +138,7 @@ sensor:
     filters:
       - delta: 0.5
     on_value:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+      - lambda: 'if (id(active_room) == 2) id(t5_display).request_refresh();'
   - platform: homeassistant
     id: thermo_set_temp
     entity_id: climate.thermostat
@@ -129,7 +147,7 @@ sensor:
     filters:
       - delta: 0.5
     on_value:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+      - lambda: 'if (id(active_room) == 2) id(t5_display).request_refresh();'
   # Thermostat — upstairs
   - platform: homeassistant
     id: thermo_up_current_temp
@@ -139,7 +157,7 @@ sensor:
     filters:
       - delta: 0.5
     on_value:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+      - lambda: 'if (id(active_room) == 2) id(t5_display).request_refresh();'
   - platform: homeassistant
     id: thermo_up_set_temp
     entity_id: climate.upstairs_thermostat
@@ -148,7 +166,24 @@ sensor:
     filters:
       - delta: 0.5
     on_value:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+      - lambda: 'if (id(active_room) == 2) id(t5_display).request_refresh();'
+
+  # Office lights brightness (attribute 0–255)
+  - platform: homeassistant
+    id: office_lights_brightness
+    entity_id: light.office_lights
+    attribute: brightness
+    internal: true
+    on_value:
+      - lambda: 'if (id(active_room) == 0) id(t5_display).request_refresh();'
+  # Plexamp volume (attribute 0.0–1.0)
+  - platform: homeassistant
+    id: plexamp_volume
+    entity_id: media_player.plex_plexamp_office
+    attribute: volume_level
+    internal: true
+    on_value:
+      - lambda: 'if (id(active_room) == 0) id(t5_display).request_refresh();'
 
   - platform: template
     id: battery_pct
@@ -184,21 +219,21 @@ text_sensor:
     entity_id: media_player.plex_plexamp_office
     internal: true
     on_value:
-      - lambda: 'if (id(active_room) == 0) id(t5_display).update();'
+      - lambda: 'if (id(active_room) == 0) id(t5_display).request_refresh();'
   - platform: homeassistant
     id: plexamp_title
     entity_id: media_player.plex_plexamp_office
     attribute: media_title
     internal: true
     on_value:
-      - lambda: 'if (id(active_room) == 0) id(t5_display).update();'
+      - lambda: 'if (id(active_room) == 0) id(t5_display).request_refresh();'
   - platform: homeassistant
     id: plexamp_artist
     entity_id: media_player.plex_plexamp_office
     attribute: media_artist
     internal: true
     on_value:
-      - lambda: 'if (id(active_room) == 0) id(t5_display).update();'
+      - lambda: 'if (id(active_room) == 0) id(t5_display).request_refresh();'
   # Thermostat modes
   - platform: homeassistant
     id: thermo_mode
@@ -206,26 +241,26 @@ text_sensor:
     attribute: hvac_action
     internal: true
     on_value:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+      - lambda: 'if (id(active_room) == 2) id(t5_display).request_refresh();'
   - platform: homeassistant
     id: thermo_hvac_mode
     entity_id: climate.thermostat
     internal: true
     on_value:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+      - lambda: 'if (id(active_room) == 2) id(t5_display).request_refresh();'
   - platform: homeassistant
     id: thermo_up_mode
     entity_id: climate.upstairs_thermostat
     attribute: hvac_action
     internal: true
     on_value:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+      - lambda: 'if (id(active_room) == 2) id(t5_display).request_refresh();'
   - platform: homeassistant
     id: thermo_up_hvac_mode
     entity_id: climate.upstairs_thermostat
     internal: true
     on_value:
-      - lambda: 'if (id(active_room) == 2) id(t5_display).update();'
+      - lambda: 'if (id(active_room) == 2) id(t5_display).request_refresh();'
   - platform: wifi_info
     ip_address:
       name: IP Address
@@ -257,6 +292,15 @@ touchscreen:
     id: t5_touch
     display: t5_display
     update_interval: 50ms
+    # Per-unit calibration. To recalibrate: temporarily bump the LOGV in
+    # t5s3_touch.cpp to LOGI, flash, tap each of the 4 corners, and average
+    # the RAW chip(x,y) values for each edge. Defaults baked into the
+    # component match unit serial #2 (June 2026).
+    calibration:
+      x_min: 12
+      x_max: 533
+      y_min: 15
+      y_max: 945
     # GT911 chip axes are swapped relative to the 960x540 display orientation.
     # Coordinate mapping done manually in on_touch lambda — raw values used directly.
     on_touch:
@@ -266,18 +310,30 @@ touchscreen:
           int ty = touch.y;
           ESP_LOGI("touch", "screen x=%d y=%d", tx, ty);
 
-          // Debounce
+          // Debounce — ESPHome's touchscreen fires on_touch only on finger-down
+          // (sustained press doesn't re-fire), so this only filters rapid
+          // intentional retaps. 150 ms allows ~6 taps/sec without doubling.
           uint32_t now_ms = millis();
-          if (now_ms - id(last_touch_ms) < 500) return;
+          if (now_ms - id(last_touch_ms) < 150) return;
           id(last_touch_ms) = now_ms;
+          // Tell the display component to defer its auto GL16 promotion
+          // while the user is actively interacting.
+          id(t5_display).notify_touch();
 
           // ── Room picker overlay (drawn over everything) ───────────────────
           if (id(show_room_picker)) {
-            // Picker rows start at y=200, each 120px, 3 rooms
-            if (ty >= 200 && ty < 560 && tx >= 40 && tx <= 500) {
-              int picked = (ty - 200) / 120;
-              id(active_room) = picked;
+            // Picker panel spans y=160..620. Rooms at 218-334, 338-454,
+            // 458-574. Cancel button at y=584-614. Anything else cancels too.
+            int picked = -1;
+            if (tx >= 30 && tx <= 510 && ty >= 160 && ty < 580) {
+              if      (ty < 338) picked = 0;  // Office row
+              else if (ty < 458) picked = 1;  // Living Room row
+              else               picked = 2;  // Climate row
             }
+            int prev = id(active_room);
+            if (picked >= 0) id(active_room) = picked;
+            ESP_LOGI("touch", "picker: tx=%d ty=%d picked=%d prev=%d after=%d",
+                     tx, ty, picked, prev, id(active_room));
             id(show_room_picker) = false;
             id(t5_display).request_full_refresh();
             id(t5_display).update();
@@ -304,58 +360,82 @@ touchscreen:
           int row = (ty - 100) / 120;
 
           if (id(active_room) == 0) {
-            if (ty < 220) {
-              id(pending_action) = 1;  // Office lights (y 100–220)
-            } else if (ty < 400) {
-              // Plexamp row (y 220–400) — three transport zones
-              if (tx >= 354) id(pending_action) = 14;      // next
-              else if (tx >= 180) id(pending_action) = 2;  // play/pause
-              else id(pending_action) = 13;                // prev
+            // Office lights — read effective (optimistic-or-HA) state, then
+            // optimistically flip and fire the HA toggle directly.
+            int opt = id(t5_display).get_optimistic(0);
+            bool lights_on = (opt >= 0) ? (opt == 1)
+                : (id(office_lights_state).has_state() && id(office_lights_state).state);
+            if (ty < 212) {
+              id(t5_display).set_optimistic(0, !lights_on);
+              id(toggle_office_lights).execute();
+              id(t5_display).update();
+            } else if (ty < 260) {
+              // Brightness slider (y 212–260, only when lights ON)
+              if (lights_on) {
+                float pct = (float)(tx - 28) / 484.0f * 100.0f;
+                int pct_i = (int)std::max(1.0f, std::min(100.0f, pct));
+                id(set_brightness).execute(pct_i);
+              }
+            } else if (ty >= 268 && ty < 448) {
+              // Plexamp row (y 268–448) — three transport zones
+              if (tx >= 354)      id(plexamp_next).execute();
+              else if (tx >= 180) id(toggle_plexamp).execute();
+              else                id(plexamp_prev).execute();
+            } else if (ty >= 454 && ty < 502) {
+              // Volume slider (y 454–502)
+              float vol = std::max(0.0f, std::min(1.0f, (float)(tx - 28) / 484.0f));
+              id(set_volume).execute(vol);
             }
           } else if (id(active_room) == 1) {
-            if (row == 0) id(pending_action) = 3;
-            else if (row == 1) id(pending_action) = 4;
-            else if (row == 2) id(pending_action) = 5;
+            auto toggle_opt = [&](uint8_t slot, auto sensor, auto &script) {
+              int opt = id(t5_display).get_optimistic(slot);
+              bool cur = (opt >= 0) ? (opt == 1)
+                  : (sensor->has_state() && sensor->state);
+              id(t5_display).set_optimistic(slot, !cur);
+              script.execute();
+              id(t5_display).update();
+            };
+            if (row == 0)      toggle_opt(1, id(living_room_main_state),     *id(toggle_lr_main));
+            else if (row == 1) toggle_opt(2, id(living_room_upstairs_state), *id(toggle_lr_upstairs));
+            else if (row == 2) toggle_opt(3, id(ceiling_fan_state),          *id(toggle_lr_fan));
           } else if (id(active_room) == 2) {
-            // Climate tab — explicit y-ranges (rows are 220px, not uniform 120px)
-            // Thermo 1: y 100–320  mode badge x≥360 / plus x≥265 / minus x≥40
-            // Thermo 2: y 336–556  same x regions
-            // HRV:      y 572–692  anywhere
+            // Climate tab — each thermostat row is 220px tall, split into:
+            //   top 106px (info + mode badge): tap right side → mode cycle
+            //   bottom 114px (button row): split at midpoint → minus / plus
+            // Main:     y=100-319 (top 100-205, bottom 206-319)
+            // Upstairs: y=336-555 (top 336-441, bottom 442-555)
+            // HRV:      y=572-691
+            const char *zone = "(none)";
             if (ty >= 100 && ty < 320) {
-              if (tx >= 360) id(pending_action) = 11;
-              else if (tx >= 265) id(pending_action) = 6;
-              else if (tx >= 40) id(pending_action) = 7;
+              int rel = ty - 100;
+              if (rel < 106) {
+                if (tx >= 280) { id(thermo_mode_cycle).execute(); zone = "main/mode"; }
+                else zone = "main/top-deadzone";
+              } else {
+                if (tx < 255) { id(thermo_setpoint_down).execute(); zone = "main/minus"; }
+                else          { id(thermo_setpoint_up).execute();   zone = "main/plus"; }
+              }
             } else if (ty >= 336 && ty < 556) {
-              if (tx >= 360) id(pending_action) = 12;
-              else if (tx >= 265) id(pending_action) = 8;
-              else if (tx >= 40) id(pending_action) = 9;
+              int rel = ty - 336;
+              if (rel < 106) {
+                if (tx >= 280) { id(thermo_up_mode_cycle).execute(); zone = "up/mode"; }
+                else zone = "up/top-deadzone";
+              } else {
+                if (tx < 255) { id(thermo_up_setpoint_down).execute(); zone = "up/minus"; }
+                else          { id(thermo_up_setpoint_up).execute();   zone = "up/plus"; }
+              }
             } else if (ty >= 572 && ty < 692) {
-              id(pending_action) = 10;
+              int opt = id(t5_display).get_optimistic(4);
+              bool cur = (opt >= 0) ? (opt == 1)
+                  : (id(hrv_state).has_state() && id(hrv_state).state);
+              id(t5_display).set_optimistic(4, !cur);
+              id(toggle_hrv).execute();
+              id(t5_display).update();
+              zone = "hrv";
+            } else {
+              zone = "gap";
             }
-          }
-
-interval:
-  - interval: 100ms
-    then:
-      - lambda: |-
-          int action = id(pending_action);
-          if (action == 0) return;
-          id(pending_action) = 0;
-          switch (action) {
-            case 1: id(toggle_office_lights).execute(); break;
-            case 2: id(toggle_plexamp).execute(); break;
-            case 3: id(toggle_lr_main).execute(); break;
-            case 4: id(toggle_lr_upstairs).execute(); break;
-            case 5: id(toggle_lr_fan).execute(); break;
-            case 6: id(thermo_setpoint_up).execute(); break;
-            case 7: id(thermo_setpoint_down).execute(); break;
-            case 8: id(thermo_up_setpoint_up).execute(); break;
-            case 9: id(thermo_up_setpoint_down).execute(); break;
-            case 10: id(toggle_hrv).execute(); break;
-            case 11: id(thermo_mode_cycle).execute(); break;
-            case 12: id(thermo_up_mode_cycle).execute(); break;
-            case 13: id(plexamp_prev).execute(); break;
-            case 14: id(plexamp_next).execute(); break;
+            ESP_LOGI("touch", "climate: tx=%d ty=%d zone=%s", tx, ty, zone);
           }
 
 script:
@@ -384,6 +464,24 @@ script:
           service: media_player.media_next_track
           data:
             entity_id: media_player.plex_plexamp_office
+  - id: set_brightness
+    parameters:
+      pct: int
+    then:
+      - homeassistant.service:
+          service: light.turn_on
+          data_template:
+            entity_id: light.office_lights
+            brightness_pct: !lambda "return pct;"
+  - id: set_volume
+    parameters:
+      level: float
+    then:
+      - homeassistant.service:
+          service: media_player.volume_set
+          data_template:
+            entity_id: media_player.plex_plexamp_office
+            volume_level: !lambda "return level;"
   - id: toggle_lr_main
     then:
       - homeassistant.service:
@@ -404,6 +502,10 @@ script:
             entity_id: switch.living_room_ceiling_fan
   - id: thermo_setpoint_up
     then:
+      - lambda: |-
+          bool has = id(thermo_set_temp).has_state();
+          float cur = has ? id(thermo_set_temp).state : NAN;
+          ESP_LOGI("climate", "main:setpoint_up has=%d cur=%.1f -> %.1f", has, cur, has ? cur + 1.0f : 20.0f);
       - homeassistant.service:
           service: climate.set_temperature
           data_template:
@@ -411,6 +513,10 @@ script:
             temperature: !lambda "return id(thermo_set_temp).has_state() ? id(thermo_set_temp).state + 1.0f : 20.0f;"
   - id: thermo_setpoint_down
     then:
+      - lambda: |-
+          bool has = id(thermo_set_temp).has_state();
+          float cur = has ? id(thermo_set_temp).state : NAN;
+          ESP_LOGI("climate", "main:setpoint_down has=%d cur=%.1f -> %.1f", has, cur, has ? cur - 1.0f : 20.0f);
       - homeassistant.service:
           service: climate.set_temperature
           data_template:
@@ -418,6 +524,10 @@ script:
             temperature: !lambda "return id(thermo_set_temp).has_state() ? id(thermo_set_temp).state - 1.0f : 20.0f;"
   - id: thermo_up_setpoint_up
     then:
+      - lambda: |-
+          bool has = id(thermo_up_set_temp).has_state();
+          float cur = has ? id(thermo_up_set_temp).state : NAN;
+          ESP_LOGI("climate", "up:setpoint_up has=%d cur=%.1f -> %.1f", has, cur, has ? cur + 1.0f : 20.0f);
       - homeassistant.service:
           service: climate.set_temperature
           data_template:
@@ -425,6 +535,10 @@ script:
             temperature: !lambda "return id(thermo_up_set_temp).has_state() ? id(thermo_up_set_temp).state + 1.0f : 20.0f;"
   - id: thermo_up_setpoint_down
     then:
+      - lambda: |-
+          bool has = id(thermo_up_set_temp).has_state();
+          float cur = has ? id(thermo_up_set_temp).state : NAN;
+          ESP_LOGI("climate", "up:setpoint_down has=%d cur=%.1f -> %.1f", has, cur, has ? cur - 1.0f : 20.0f);
       - homeassistant.service:
           service: climate.set_temperature
           data_template:
@@ -438,6 +552,9 @@ script:
             entity_id: switch.hrv
   - id: thermo_mode_cycle
     then:
+      - lambda: |-
+          std::string m = id(thermo_hvac_mode).has_state() ? id(thermo_hvac_mode).state : std::string("(unknown)");
+          ESP_LOGI("climate", "main:mode_cycle cur=%s", m.c_str());
       - homeassistant.service:
           service: climate.set_hvac_mode
           data_template:
@@ -450,6 +567,9 @@ script:
               return std::string("heat");
   - id: thermo_up_mode_cycle
     then:
+      - lambda: |-
+          std::string m = id(thermo_up_hvac_mode).has_state() ? id(thermo_up_hvac_mode).state : std::string("(unknown)");
+          ESP_LOGI("climate", "up:mode_cycle cur=%s", m.c_str());
       - homeassistant.service:
           service: climate.set_hvac_mode
           data_template:
@@ -554,7 +674,10 @@ display:
   - platform: t5s3_epaper
     id: t5_display
     rotation: 270
-    update_interval: 5min
+    # Render is driven by request_refresh() on HA state changes + update() on
+    # touch. update_interval just acts as a long keepalive so the battery icon
+    # and HA-connection indicator stay fresh during long quiet periods.
+    update_interval: 30min
     lambda: |-
       // Portrait: 540px wide x 960px tall
       auto black = Color(0, 0, 0);
@@ -576,10 +699,19 @@ display:
 
       // Backlight toggle (x 420–540)
       it.rectangle(420, 0, 120, 80, black);
-      it.print(480, 40, id(roboto24), black, TextAlign::CENTER, "Light");
+      it.print(480, 40, id(roboto20), black, TextAlign::CENTER, "Backlight");
 
       // ── Divider ──────────────────────────────────────────────────────────
       it.horizontal_line(0, 84, W, black);
+
+      // ── Stale-data banner (HA disconnected) ──────────────────────────────
+      // Fits in the gap between divider y=84 and content y=100.
+      bool ha_connected_top = global_api_server->is_connected();
+      if (!ha_connected_top) {
+        id(t5_display).fast_rect(0, 86, W, 14, black);
+        it.print(W / 2, 93, id(roboto16), white, TextAlign::CENTER,
+                 "OFFLINE — LAST KNOWN STATE");
+      }
 
       // ── Control rows ─────────────────────────────────────────────────────
       // Each row: 16px margin, 110px tall, icon left, label centre, badge right.
@@ -589,7 +721,7 @@ display:
         Color row_bg = is_on ? black : white;
 
         if (is_on)
-          it.filled_rectangle(16, row_y, W - 32, 106, black);
+          id(t5_display).fast_rect(16, row_y, W - 32, 106, black);
         else
           it.rectangle(16, row_y, W - 32, 106, black);
 
@@ -609,11 +741,28 @@ display:
       };
 
       if (id(active_room) == 0) {
-        bool lights_on = id(office_lights_state).has_state() && id(office_lights_state).state;
+        int opt_ol = id(t5_display).get_optimistic(0);
+        bool lights_on = (opt_ol >= 0) ? (opt_ol == 1)
+            : (id(office_lights_state).has_state() && id(office_lights_state).state);
         draw_row(100, lights_on ? id(img_bulb_on) : id(img_bulb_off),
                  "Office Lights", "", lights_on);
 
-        // ── Plexamp media row (y 220–400, 180px) ─────────────────────────────
+        // ── Brightness slider (y 212–260, only when lights ON) ───────────────
+        if (lights_on) {
+          float bpct = id(office_lights_brightness).has_state()
+                     ? id(office_lights_brightness).state / 255.0f * 100.0f : 0.0f;
+          it.print(28, 212, id(roboto16), black, TextAlign::TOP_LEFT, "Brightness");
+          it.printf(W - 28, 212, id(roboto16), black, TextAlign::TOP_RIGHT, "%.0f%%", bpct);
+          it.rectangle(28, 230, W - 56, 24, black);
+          int bw = (int)((W - 56) * bpct / 100.0f);
+          if (bw > 0) it.filled_rectangle(28, 230, bw, 24, black);
+          // Thumb: tall mark spanning above + below the bar so it's visible at 0% and 100%
+          int bt = 28 + bw;
+          it.filled_rectangle(bt - 3, 224, 6, 36, black);
+          it.filled_rectangle(bt - 1, 228, 2, 28, white);
+        }
+
+        // ── Plexamp media row (y 268–448, 180px) ────────────────────────────
         {
           std::string state  = id(plexamp_state).has_state()  ? id(plexamp_state).state  : std::string("off");
           std::string title  = id(plexamp_title).has_state()  ? id(plexamp_title).state  : std::string("");
@@ -621,50 +770,61 @@ display:
           bool playing = (state == "playing");
           bool active  = (state == "playing" || state == "paused");
 
-          it.rectangle(16, 220, W - 32, 180, black);
+          it.rectangle(16, 268, W - 32, 180, black);
 
-          // Music icon (left, vertically centered in info area)
-          it.image(50, 270, id(img_music), ImageAlign::CENTER, black, white);
+          it.image(50, 318, id(img_music), ImageAlign::CENTER, black, white);
+          it.print(90, 280, id(roboto20), black, TextAlign::CENTER_LEFT, "Plexamp");
 
-          // "Plexamp" label
-          it.print(90, 232, id(roboto20), black, TextAlign::CENTER_LEFT, "Plexamp");
-
-          // Status badge (top-right: x 330–524)
           const char *state_label = playing ? "PLAYING" : (state == "paused" ? "PAUSED" : "OFF");
           if (active) {
-            it.filled_rectangle(330, 228, 194, 36, black);
-            it.print(427, 246, id(roboto16), white, TextAlign::CENTER, state_label);
+            it.filled_rectangle(330, 276, 194, 36, black);
+            it.print(427, 294, id(roboto16), white, TextAlign::CENTER, state_label);
           } else {
-            it.rectangle(330, 228, 194, 36, black);
-            it.print(427, 246, id(roboto16), black, TextAlign::CENTER, state_label);
+            it.rectangle(330, 276, 194, 36, black);
+            it.print(427, 294, id(roboto16), black, TextAlign::CENTER, state_label);
           }
 
-          // Track title + artist (truncate at 36 chars to fit row width)
           auto trunc = [](const std::string &s) -> std::string {
             return s.length() > 36 ? s.substr(0, 34) + ".." : s;
           };
           if (!title.empty())
-            it.print(90, 264, id(roboto16), black, TextAlign::CENTER_LEFT, trunc(title).c_str());
+            it.print(90, 312, id(roboto16), black, TextAlign::CENTER_LEFT, trunc(title).c_str());
           if (!artist.empty())
-            it.print(90, 285, id(roboto16), black, TextAlign::CENTER_LEFT, trunc(artist).c_str());
+            it.print(90, 333, id(roboto16), black, TextAlign::CENTER_LEFT, trunc(artist).c_str());
 
-          // Divider above transport buttons
-          it.horizontal_line(28, 312, W - 56, black);
+          it.horizontal_line(28, 360, W - 56, black);
 
-          // Transport buttons (y 320–390): [⏮ PREV] [⏯ PLAY/PAUSE] [⏭ NEXT]
-          // Three equal zones: x 28–180 / 188–346 / 354–506
-          it.rectangle(28,  320, 152, 70, black);
-          it.rectangle(188, 320, 152, 70, black);
-          it.rectangle(348, 320, 152, 70, black);
-          it.print(104, 355, id(mdi40), black, TextAlign::CENTER, "\U000F04AE");  // skip-previous
-          it.print(264, 355, id(mdi40), black, TextAlign::CENTER,
+          // Transport buttons (y 368–438): [⏮ PREV] [⏯ PLAY/PAUSE] [⏭ NEXT]
+          it.rectangle(28,  368, 152, 70, black);
+          it.rectangle(188, 368, 152, 70, black);
+          it.rectangle(348, 368, 152, 70, black);
+          it.print(104, 403, id(mdi40), black, TextAlign::CENTER, "\U000F04AE");  // skip-previous
+          it.print(264, 403, id(mdi40), black, TextAlign::CENTER,
                    playing ? "\U000F03E4" : "\U000F040A");                         // pause / play
-          it.print(424, 355, id(mdi40), black, TextAlign::CENTER, "\U000F04AD");  // skip-next
+          it.print(424, 403, id(mdi40), black, TextAlign::CENTER, "\U000F04AD");  // skip-next
+        }
+
+        // ── Volume slider (y 454–502) ─────────────────────────────────────────
+        {
+          float vpct = id(plexamp_volume).has_state() ? id(plexamp_volume).state * 100.0f : 0.0f;
+          it.print(28, 454, id(roboto16), black, TextAlign::TOP_LEFT, "Volume");
+          it.printf(W - 28, 454, id(roboto16), black, TextAlign::TOP_RIGHT, "%.0f%%", vpct);
+          it.rectangle(28, 472, W - 56, 24, black);
+          int vw = (int)((W - 56) * vpct / 100.0f);
+          if (vw > 0) it.filled_rectangle(28, 472, vw, 24, black);
+          int vt = 28 + vw;
+          it.filled_rectangle(vt - 3, 466, 6, 36, black);
+          it.filled_rectangle(vt - 1, 470, 2, 28, white);
         }
       } else if (id(active_room) == 1) {
-        bool main_on     = id(living_room_main_state).has_state()     && id(living_room_main_state).state;
-        bool upstairs_on = id(living_room_upstairs_state).has_state() && id(living_room_upstairs_state).state;
-        bool fan_on      = id(ceiling_fan_state).has_state()          && id(ceiling_fan_state).state;
+        auto eff = [&](uint8_t slot, auto sensor) -> bool {
+          int opt = id(t5_display).get_optimistic(slot);
+          if (opt >= 0) return opt == 1;
+          return sensor->has_state() && sensor->state;
+        };
+        bool main_on     = eff(1, id(living_room_main_state));
+        bool upstairs_on = eff(2, id(living_room_upstairs_state));
+        bool fan_on      = eff(3, id(ceiling_fan_state));
 
         draw_row(100, main_on ? id(img_bulb_on) : id(img_bulb_off),
                  "Main Lights", "", main_on);
@@ -732,7 +892,9 @@ display:
         std::string action1 = id(thermo_mode).has_state()         ? id(thermo_mode).state          : std::string("");
         std::string mode2   = id(thermo_up_hvac_mode).has_state() ? id(thermo_up_hvac_mode).state : std::string("");
         std::string action2 = id(thermo_up_mode).has_state()      ? id(thermo_up_mode).state      : std::string("");
-        bool hrv_on = id(hrv_state).has_state() && id(hrv_state).state;
+        int opt_hrv = id(t5_display).get_optimistic(4);
+        bool hrv_on = (opt_hrv >= 0) ? (opt_hrv == 1)
+            : (id(hrv_state).has_state() && id(hrv_state).state);
 
         // Thermo row 1: y=100–320, Thermo row 2: y=336–556, HRV: y=572–692
         draw_thermo_row(100, "Main Thermostat",     cur1, set1, mode1, action1);
@@ -743,7 +905,7 @@ display:
       // ── Room picker overlay ───────────────────────────────────────────────
       if (id(show_room_picker)) {
         // Semi-opaque overlay: white-filled panel with black border (3 rooms = 460px)
-        it.filled_rectangle(30, 160, W - 60, 460, white);
+        id(t5_display).fast_rect(30, 160, W - 60, 460, white);
         it.rectangle(30, 160, W - 60, 460, black);
         it.rectangle(31, 161, W - 62, 458, black);  // double border
 
@@ -756,7 +918,7 @@ display:
           int ry = 220 + i * 120;
           if (i == id(active_room)) {
             // Highlight current room
-            it.filled_rectangle(32, ry - 2, W - 64, 116, black);
+            id(t5_display).fast_rect(32, ry - 2, W - 64, 116, black);
             it.print(80, ry + 55, id(roboto24), white, TextAlign::CENTER_LEFT, picker_rooms[i]);
             it.print(W / 2 + 160, ry + 55, id(mdi40), white, TextAlign::CENTER_RIGHT, "\U000F05E0");  // check-circle
           } else {
@@ -765,8 +927,9 @@ display:
           }
         }
 
-        // Cancel hint
-        it.print(W / 2, 635, id(roboto16), black, TextAlign::CENTER, "Tap outside to cancel");
+        // Cancel button (inside panel, below Climate row)
+        it.rectangle(120, 584, 300, 30, black);
+        it.print(W / 2, 599, id(roboto16), black, TextAlign::CENTER, "Cancel");
       }
 
       // ── Bottom info strip ─────────────────────────────────────────────────
