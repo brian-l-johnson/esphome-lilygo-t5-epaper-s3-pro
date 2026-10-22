@@ -39,4 +39,5 @@ async def to_code(config):
     # Frogy76's epdiy fork — fixes ESP-IDF 5.5.x compatibility issues in the
     # upstream library (gpio_hal_iomux_func_sel removal, RCC atomic env, GDMA API).
     # Uses lilygo_board_s3 + ED047TC1 (4.7", 960x540, parallel interface, PCA9535+TPS65185).
-    cg.add_library("epdiy", None, "https://github.com/Frogy76/epdiy")
+    # Pinned to a known-good commit so upstream pushes can't break builds.
+    cg.add_library("epdiy", None, "https://github.com/Frogy76/epdiy#148d877db9bc5eabd06bc07ad8a64bbf56a1962d")

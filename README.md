@@ -56,6 +56,23 @@ After flashing you should see a clock + battery readout on the e-paper. If
 the display is blank or refreshes are very slow, check the **Gotchas**
 section below.
 
+## Using the component in your own config
+
+You don't need to clone this repo to use the component. Point
+`external_components` at GitHub and ESPHome will fetch it:
+
+```yaml
+external_components:
+  - source: github://brian-l-johnson/esphome-lilygo-t5-epaper-s3-pro@main
+    components: [t5s3_epaper]
+```
+
+Then copy the `esphome:`, `esp32:`, `display:` and `touchscreen:` sections
+from `example.yaml`. The `platformio_options` and `sdkconfig_options` there
+are required, not optional (see **Gotchas**). The component pulls in
+[Frogy76's epdiy fork](https://github.com/Frogy76/epdiy), pinned to a
+known-good commit.
+
 ## Touch calibration
 
 **You must calibrate touch for your unit.** Per-panel manufacturing variance
