@@ -1,7 +1,7 @@
 # Minimal example for the LilyGo T5 E-Paper S3 Pro under ESPHome.
 #
 # This brings the display + touch up with a clock/battery UI and logs every
-# tap. Start here, then grow toward your own integration. See mod.yaml for
+# tap. Start here, then grow toward your own integration. See office-remote.yaml for
 # a full Home Assistant remote-control example (the author's working config).
 #
 # First-time setup:

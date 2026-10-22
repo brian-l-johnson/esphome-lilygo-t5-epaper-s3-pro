@@ -6,3 +6,6 @@ venv*
 # Editor backups
 *~
 DEADJOE
+.venv/
+# Claude Code local settings
+.claude/

@@ -12,7 +12,14 @@ ESPHome custom component for the [LilyGo T5 4.7" E-Paper S3 Pro](https://www.lil
 > This is a fork of [nickolay/esphome-lilygo-t547plus](https://github.com/nickolay/esphome-lilygo-t547plus)
 > rewritten for the S3 Pro hardware. **Not for the original T5 4.7" v2.3**
 > (different MCU, different I2C/GPIO map). Use the upstream repo if you have
-> that board.
+> that board — its `t547` component has been removed here.
+
+As far as I know this is the first working ESPHome support for the S3 Pro.
+LilyGo only ships Arduino/PlatformIO firmware for it, so the board bring-up
+(PCA9535 + TPS65185 power sequencing, epdiy on ESP-IDF 5.5, GT911 touch) is
+done from scratch in the component. The **Gotchas** and **Architecture
+notes** sections below record the non-obvious things that took the most
+time to figure out.
 
 ## Files in this repo
 
@@ -21,14 +28,15 @@ ESPHome custom component for the [LilyGo T5 4.7" E-Paper S3 Pro](https://www.lil
 | `example.yaml` | **Start here.** Minimal config: clock + battery + touch logging. ~110 lines. |
 | `office-remote.yaml` | The author's working config: 3-room HA remote control (lights, climate, media). ~1000 lines. Useful as a reference but won't run as-is for you — references specific HA entity IDs. |
 | `components/t5s3_epaper/` | The ESPHome external component (display + touchscreen). |
+| `docs/` | Design notes (e.g. deep-sleep plan, not yet implemented). |
 | `secrets.yaml.template` | Copy to `secrets.yaml` and fill in. |
 | `wifi-secrets.yaml.template` | Copy to `wifi-secrets.yaml` and fill in. |
 
 ## Quick start
 
 ```sh
-git clone https://github.com/nickolay/esphome-lilygo-t547plus.git
-cd esphome-lilygo-t547plus
+git clone https://github.com/brian-l-johnson/esphome-lilygo-t5-epaper-s3-pro.git
+cd esphome-lilygo-t5-epaper-s3-pro
 
 cp secrets.yaml.template     secrets.yaml      # fill in: api_encryption_key, api_ota_password
 cp wifi-secrets.yaml.template wifi-secrets.yaml # fill in: WiFi SSID + password
@@ -39,6 +47,10 @@ esphome run example.yaml
 Requires:
 - ESPHome ≥ 2023.12 (tested on 2026.4.5)
 - PlatformIO with the `pioarduino` platform (ESP-IDF 5.5.x)
+
+The Material Design Icons font used by `office-remote.yaml` is downloaded
+at build time; Roboto comes from Google Fonts. No font files need to be
+added by hand.
 
 After flashing you should see a clock + battery readout on the e-paper. If
 the display is blank or refreshes are very slow, check the **Gotchas**
@@ -186,4 +198,5 @@ On Windows, replace with `${sysenv.USERPROFILE}` or hardcode the path.
 
 ## License
 
-MIT (inherited from upstream).
+[ESPHome License](LICENSE), inherited from upstream: MIT for the Python
+code, GPLv3 for the C/C++ code.
