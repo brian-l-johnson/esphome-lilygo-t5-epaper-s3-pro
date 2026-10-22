@@ -1,5 +1,18 @@
 esphome:
   name: lilygo
+  on_boot:
+    # Render the boot screen as soon as the display is ready, before WiFi.
+    priority: -100
+    then:
+      - component.update: t5_display
+      # Fallback: if WiFi never comes up, time out the boot screen after 30s.
+      - delay: 30s
+      - lambda: |-
+          if (!id(boot_done)) {
+            id(boot_done) = true;
+            id(t5_display).request_full_refresh();
+            id(t5_display).update();
+          }
   platformio_options:
     upload_speed: 921600
     monitor_speed: 115200
@@ -8,9 +21,10 @@ esphome:
     board_build.memory_type: qio_opi
     # epdiy's epd_board_common.c needs esp_adc headers to compile (excluded by ESPHome).
     # lilygo_board_s3 never calls those ADC functions so they'll be GC'd at link time.
+    # Adjust the path if your PlatformIO is not at ~/.platformio.
     build_flags:
-      - "-I/home/bj/.platformio/packages/framework-espidf/components/esp_adc/include"
-      - "-I/home/bj/.platformio/packages/framework-espidf/components/esp_adc/esp32s3/include"
+      - "-I${sysenv.HOME}/.platformio/packages/framework-espidf/components/esp_adc/include"
+      - "-I${sysenv.HOME}/.platformio/packages/framework-espidf/components/esp_adc/esp32s3/include"
       - "-DBOARD_HAS_PSRAM"
 
 esp32:
@@ -57,7 +71,9 @@ api:
     key: !secret api_encryption_key
   on_client_connected:
     - logger.log: "HA client connected — scheduling full display refresh"
-    - lambda: 'id(t5_display).request_full_refresh();'
+    - lambda: |-
+        id(boot_done) = true;
+        id(t5_display).request_full_refresh();
     - component.update: t5_display
   on_client_disconnected:
     - logger.log: "HA client disconnected"
@@ -69,6 +85,10 @@ ota:
 
 wifi: !include wifi-secrets.yaml
 
+time:
+  - platform: homeassistant
+    id: ntp
+
 globals:
   - id: active_room
     type: int
@@ -79,6 +99,28 @@ globals:
     restore_value: false
     initial_value: '0'
   - id: show_room_picker
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # Living Room TV — input picker overlay + live source_list from HA
+  - id: show_input_picker
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  - id: tv_source_list
+    type: std::vector<std::string>
+    restore_value: false
+  # Charger-auto-clock state
+  - id: previous_room
+    type: int
+    restore_value: false
+    initial_value: '0'   # restored when charger unplugs / diagnostics exit
+  - id: was_on_charger
+    type: bool
+    restore_value: false
+    initial_value: 'false'   # tracks transitions
+  # Boot screen — cleared once WiFi is up + grace delay
+  - id: boot_done
     type: bool
     restore_value: false
     initial_value: 'false'
@@ -184,6 +226,14 @@ sensor:
     internal: true
     on_value:
       - lambda: 'if (id(active_room) == 0) id(t5_display).request_refresh();'
+  # Living Room TV (Savant zone) — zone volume 0.0–1.0
+  - platform: homeassistant
+    id: lr_tv_volume
+    entity_id: media_player.living_room
+    attribute: volume_level
+    internal: true
+    on_value:
+      - lambda: 'if (id(active_room) == 5) id(t5_display).request_refresh();'
 
   - platform: template
     id: battery_pct
@@ -261,6 +311,47 @@ text_sensor:
     internal: true
     on_value:
       - lambda: 'if (id(active_room) == 2) id(t5_display).request_refresh();'
+  # ── Living Room TV (Savant zone media_player.living_room) ──────────────
+  - platform: homeassistant
+    id: lr_tv_state
+    entity_id: media_player.living_room
+    internal: true
+    on_value:
+      - lambda: 'if (id(active_room) == 5) id(t5_display).request_refresh();'
+  - platform: homeassistant
+    id: lr_tv_source
+    entity_id: media_player.living_room
+    attribute: source
+    internal: true
+    on_value:
+      - lambda: 'if (id(active_room) == 5) id(t5_display).request_refresh();'
+  # source_list arrives as HA's str(list) repr, e.g. ['Cable Box', 'Apple TV'].
+  # Parse the quoted items into tv_source_list for the input picker overlay.
+  - platform: homeassistant
+    id: lr_tv_source_list
+    entity_id: media_player.living_room
+    attribute: source_list
+    internal: true
+    on_value:
+      - lambda: |-
+          auto &v = id(tv_source_list);
+          v.clear();
+          const std::string &s = x;
+          size_t i = 0;
+          while (i < s.size()) {
+            char c = s[i];
+            if (c == '\'' || c == '"') {
+              size_t j = s.find(c, i + 1);
+              if (j == std::string::npos) break;
+              v.push_back(s.substr(i + 1, j - i - 1));
+              i = j + 1;
+            } else {
+              i++;
+            }
+          }
+          ESP_LOGI("tv", "parsed %d sources from source_list", (int)v.size());
+          if (id(active_room) == 5) id(t5_display).request_refresh();
+
   - platform: wifi_info
     ip_address:
       name: IP Address
@@ -322,19 +413,41 @@ touchscreen:
 
           // ── Room picker overlay (drawn over everything) ───────────────────
           if (id(show_room_picker)) {
-            // Picker panel spans y=160..620. Rooms at 218-334, 338-454,
-            // 458-574. Cancel button at y=584-614. Anything else cancels too.
+            // Rows start at y=220, 116px tall, 120px pitch (see picker draw).
+            // Maps picker rows → active_room index. Anything else cancels.
+            static const int picker_indices[] = {0, 1, 2, 5};
+            const int NP = sizeof(picker_indices) / sizeof(picker_indices[0]);
             int picked = -1;
-            if (tx >= 30 && tx <= 510 && ty >= 160 && ty < 580) {
-              if      (ty < 338) picked = 0;  // Office row
-              else if (ty < 458) picked = 1;  // Living Room row
-              else               picked = 2;  // Climate row
+            if (tx >= 30 && tx <= 510) {
+              for (int i = 0; i < NP; i++) {
+                int ry = 218 + i * 120;
+                if (ty >= ry && ty < ry + 116) { picked = picker_indices[i]; break; }
+              }
             }
             int prev = id(active_room);
             if (picked >= 0) id(active_room) = picked;
             ESP_LOGI("touch", "picker: tx=%d ty=%d picked=%d prev=%d after=%d",
                      tx, ty, picked, prev, id(active_room));
             id(show_room_picker) = false;
+            id(t5_display).request_full_refresh();
+            id(t5_display).update();
+            return;
+          }
+
+          // ── Input picker overlay (Living Room TV) ─────────────────────────
+          if (id(show_input_picker)) {
+            // Rows start at y=200, 80px tall, 84px pitch (see input picker draw).
+            auto &srcs = id(tv_source_list);
+            int n = (int)srcs.size();
+            int picked = -1;
+            if (tx >= 40 && tx <= 500) {
+              for (int i = 0; i < n; i++) {
+                int ry = 200 + i * 84;
+                if (ty >= ry && ty < ry + 80) { picked = i; break; }
+              }
+            }
+            if (picked >= 0) id(lr_tv_select_source).execute(srcs[picked]);
+            id(show_input_picker) = false;
             id(t5_display).request_full_refresh();
             id(t5_display).update();
             return;
@@ -351,6 +464,37 @@ touchscreen:
               // Backlight toggle (right 120px)
               auto call = id(backlight_light).toggle();
               call.perform();
+            }
+            return;
+          }
+
+          // ── Living Room TV remote (own geometry, extends past y=700) ──────
+          if (id(active_room) == 5) {
+            // Power (x 384–524, y 108–168)
+            if (tx >= 384 && ty >= 108 && ty <= 168) {
+              id(lr_tv_power).execute();
+              return;
+            }
+            // Input selector button (y 188–252) → open input picker
+            if (ty >= 188 && ty <= 252) {
+              id(show_input_picker) = true;
+              id(t5_display).request_full_refresh();
+              id(t5_display).update();
+              return;
+            }
+            // D-pad cluster (+ Home in the top-left corner)
+            if (ty >= 280 && ty <= 380 && tx >= 84  && tx <= 204) { id(lr_tv_cmd).execute("home");   return; }
+            if (ty >= 280 && ty <= 380 && tx >= 210 && tx <= 330) { id(lr_tv_cmd).execute("up");     return; }
+            if (ty >= 388 && ty <= 488) {
+              if (tx >= 84  && tx <= 204) { id(lr_tv_cmd).execute("left");   return; }
+              if (tx >= 210 && tx <= 330) { id(lr_tv_cmd).execute("select"); return; }
+              if (tx >= 336 && tx <= 456) { id(lr_tv_cmd).execute("right");  return; }
+            }
+            if (ty >= 496 && ty <= 596 && tx >= 210 && tx <= 330) { id(lr_tv_cmd).execute("down");   return; }
+            // Volume rocker (y 626–722)
+            if (ty >= 626 && ty <= 722) {
+              if      (tx >= 84  && tx < 273)  { id(lr_tv_vol_down).execute(); return; }
+              else if (tx >= 276 && tx <= 462) { id(lr_tv_vol_up).execute();   return; }
             }
             return;
           }
@@ -437,6 +581,38 @@ touchscreen:
             }
             ESP_LOGI("touch", "climate: tx=%d ty=%d zone=%s", tx, ty, zone);
           }
+
+interval:
+  # Auto-switch to clock face on/off charger (gated by the HA switch).
+  - interval: 5s
+    then:
+      - lambda: |-
+          if (!id(auto_clock_when_charging).state) return;
+          bool now_charged = id(t5_display).charger_present();
+          if (now_charged && !id(was_on_charger)) {
+            // Plugged in — save current view, switch to clock.
+            if (id(active_room) != 3) id(previous_room) = id(active_room);
+            id(active_room) = 3;
+            id(was_on_charger) = true;
+            id(t5_display).request_full_refresh();
+            id(t5_display).update();
+          } else if (!now_charged && id(was_on_charger)) {
+            // Unplugged — restore the previously active room.
+            id(active_room) = id(previous_room);
+            id(was_on_charger) = false;
+            id(t5_display).request_full_refresh();
+            id(t5_display).update();
+          }
+  # Re-render the clock face every minute so HH:MM updates.
+  - interval: 60s
+    then:
+      - lambda: |-
+          if (id(active_room) == 3) id(t5_display).request_refresh();
+  # Refresh diagnostics view every 30s so battery / heap stay current.
+  - interval: 30s
+    then:
+      - lambda: |-
+          if (id(active_room) == 4) id(t5_display).request_refresh();
 
 script:
   - id: toggle_office_lights
@@ -581,6 +757,60 @@ script:
               if (m == "cool") return std::string("off");
               return std::string("heat");
 
+  # ── Living Room TV (Savant zone) ──────────────────────────────────────
+  # Power toggles the whole zone on/off.
+  - id: lr_tv_power
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(lr_tv_state).has_state()
+                     && id(lr_tv_state).state != "off"
+                     && id(lr_tv_state).state != "unavailable"
+                     && id(lr_tv_state).state != "unknown";
+          then:
+            - homeassistant.service:
+                service: media_player.turn_off
+                data:
+                  entity_id: media_player.living_room
+          else:
+            - homeassistant.service:
+                service: media_player.turn_on
+                data:
+                  entity_id: media_player.living_room
+  # D-pad / nav keys → active source in the zone via remote.send_command.
+  - id: lr_tv_cmd
+    parameters:
+      command: string
+    then:
+      - homeassistant.service:
+          service: remote.send_command
+          data_template:
+            entity_id: remote.living_room_living_room
+            command: !lambda "return command;"
+  # Zone (Savant amplifier) volume — what a TV remote's volume keys should do.
+  - id: lr_tv_vol_up
+    then:
+      - homeassistant.service:
+          service: media_player.volume_up
+          data:
+            entity_id: media_player.living_room
+  - id: lr_tv_vol_down
+    then:
+      - homeassistant.service:
+          service: media_player.volume_down
+          data:
+            entity_id: media_player.living_room
+  - id: lr_tv_select_source
+    parameters:
+      source: string
+    then:
+      - homeassistant.service:
+          service: media_player.select_source
+          data_template:
+            entity_id: media_player.living_room
+            source: !lambda "return source;"
+
 output:
   - platform: gpio
     pin: GPIO11
@@ -592,6 +822,44 @@ light:
     id: backlight_light
     output: backlight
     restore_mode: ALWAYS_ON
+
+button:
+  - platform: template
+    name: "Show Diagnostics"
+    on_press:
+      - lambda: |-
+          if (id(active_room) != 4) id(previous_room) = id(active_room);
+          id(active_room) = 4;
+          id(t5_display).request_full_refresh();
+          id(t5_display).update();
+
+switch:
+  # When ON: plugging the device into any charger switches to the clock
+  # face; unplugging returns to the previous room.  Default OFF.  Toggle
+  # from Home Assistant (or from the device's HA card).
+  - platform: template
+    name: "Auto Clock When Charging"
+    id: auto_clock_when_charging
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    # Take effect immediately on toggle.
+    on_turn_on:
+      - lambda: |-
+          if (id(t5_display).charger_present()) {
+            if (id(active_room) != 3) id(previous_room) = id(active_room);
+            id(active_room) = 3;
+            id(was_on_charger) = true;
+            id(t5_display).request_full_refresh();
+            id(t5_display).update();
+          }
+    on_turn_off:
+      - lambda: |-
+          if (id(active_room) == 3) {
+            id(active_room) = id(previous_room);
+            id(was_on_charger) = false;
+            id(t5_display).request_full_refresh();
+            id(t5_display).update();
+          }
 
 image:
   - file: images/lightbulb-on.svg
@@ -632,7 +900,20 @@ font:
     id: roboto24
     size: 24
 
-  - file: "fonts/materialdesignicons-webfont.ttf"
+  - file: "gfonts://Roboto"
+    id: roboto32
+    size: 32
+
+  # Big time digits for the clock face (when on charger).
+  - file: "gfonts://Roboto"
+    id: roboto160
+    size: 160
+    glyphs: '0123456789: '
+
+  # Material Design Icons, pinned release — downloaded at build time.
+  - file:
+      type: web
+      url: https://raw.githubusercontent.com/Templarian/MaterialDesign-Webfont/v7.4.47/fonts/materialdesignicons-webfont.ttf
     id: mdi40
     size: 40
     glyphs:
@@ -658,6 +939,8 @@ font:
       - "\U000F05E0"  # check-circle
       - "\U000F0159"  # close-circle
       - "\U000F0140"  # chevron-down
+      - "\U000F0141"  # chevron-left
+      - "\U000F0142"  # chevron-right
       - "\U000F0143"  # chevron-up
       - "\U000F0156"  # close
       - "\U000F050F"  # thermometer
@@ -687,9 +970,35 @@ display:
 
       it.fill(white);
 
+      // ── Boot screen ──────────────────────────────────────────────────────
+      // Shown until WiFi+HA are both up (or the 30s timeout in esphome.on_boot).
+      if (!id(boot_done)) {
+        it.print(W / 2, 220, id(roboto32), black, TextAlign::TOP_CENTER, "LilyGo T5 S3 Pro");
+        it.print(W / 2, 270, id(roboto20), black, TextAlign::TOP_CENTER, "ESPHome E-Paper Remote");
+        it.horizontal_line(W / 2 - 80, 320, 160, black);
+
+        bool wifi_ok = id(wifi_ip).has_state() && id(wifi_ip).state.length() > 0
+                        && id(wifi_ip).state != std::string("0.0.0.0");
+        bool ha_ok = global_api_server->is_connected();
+
+        it.print(W / 2, 400, id(roboto24), black, TextAlign::TOP_CENTER,
+                 ha_ok ? "Ready" : (wifi_ok ? "Connecting to Home Assistant…" : "Connecting to Wi-Fi…"));
+
+        if (wifi_ok) {
+          it.printf(W / 2, 460, id(roboto20), black, TextAlign::TOP_CENTER,
+                    "%s", id(wifi_ip).state.c_str());
+        }
+
+        it.printf(W / 2, 880, id(roboto16), black, TextAlign::TOP_CENTER,
+                  "ESPHome %s", ESPHOME_VERSION);
+        return;
+      }
+
       // ── Top bar (y 0–80): current room + chevron + backlight ─────────────
-      static const char *room_names[] = {"Office", "Living Room", "Climate"};
-      const char *room_name = room_names[id(active_room)];
+      static const char *room_names[] = {"Office", "Living Room", "Climate", "Clock", "Diagnostics", "Living Room TV"};
+      int room_idx = id(active_room);
+      if (room_idx < 0 || room_idx > 5) room_idx = 0;
+      const char *room_name = room_names[room_idx];
 
       // Room selector button (x 0–420): filled black
       it.filled_rectangle(0, 0, 420, 80, black);
@@ -900,24 +1209,156 @@ display:
         draw_thermo_row(100, "Main Thermostat",     cur1, set1, mode1, action1);
         draw_thermo_row(336, "Upstairs Thermostat", cur2, set2, mode2, action2);
         draw_row(572, id(img_fan), "HRV", "", hrv_on);
+      } else if (id(active_room) == 3) {
+        // ── Clock face (auto-shown when on charger) ─────────────────────────
+        // Big time at the visual center, day + date underneath.
+        it.strftime(W / 2, 260, id(roboto160), black,
+                    TextAlign::TOP_CENTER, "%H:%M", id(ntp).now());
+        it.strftime(W / 2, 480, id(roboto32), black,
+                    TextAlign::TOP_CENTER, "%A", id(ntp).now());
+        it.strftime(W / 2, 530, id(roboto32), black,
+                    TextAlign::TOP_CENTER, "%B %d, %Y", id(ntp).now());
+        // Footer hint
+        it.print(W / 2, 720, id(roboto20), black, TextAlign::TOP_CENTER,
+                 "Unplug to return to the remote");
+      } else if (id(active_room) == 4) {
+        // ── Diagnostics view ────────────────────────────────────────────────
+        it.print(28, 100, id(roboto24), black, TextAlign::TOP_LEFT, "Diagnostics");
+        it.horizontal_line(28, 134, W - 56, black);
+
+        int dy = 150;
+        auto section = [&](const char *title) {
+          it.print(28, dy, id(roboto20), black, TextAlign::TOP_LEFT, title);
+          dy += 26;
+        };
+
+        // Battery
+        section("Battery");
+        float bp = id(t5_display).get_battery_pct();
+        float bm = id(t5_display).get_battery_mv();
+        float ba = id(t5_display).get_battery_ma();
+        it.printf(50, dy, id(roboto16), black, TextAlign::TOP_LEFT,
+                  "%.0f%%   %.2f V   %s%d mA",
+                  bp, bm / 1000.0f, ba >= 0 ? "+" : "", (int)ba);
+        dy += 22;
+
+        // Charger
+        section("Charger (BQ25896)");
+        static const char *vbus_names[] = {"None", "USB SDP", "Adapter", "—", "—", "—", "—", "OTG"};
+        static const char *cstate_names[] = {"Not Charging", "Pre-Charge", "Fast Charge", "Done"};
+        uint8_t vbus = id(t5_display).get_charger_vbus();
+        uint8_t cstate = id(t5_display).get_charger_state();
+        it.printf(50, dy, id(roboto16), black, TextAlign::TOP_LEFT,
+                  "VBUS: %s", vbus_names[vbus & 0x07]);
+        dy += 22;
+        it.printf(50, dy, id(roboto16), black, TextAlign::TOP_LEFT,
+                  "State: %s", cstate_names[cstate & 0x03]);
+        dy += 30;
+
+        // Wi-Fi
+        section("Wi-Fi");
+        it.printf(50, dy, id(roboto16), black, TextAlign::TOP_LEFT,
+                  "IP: %s", id(wifi_ip).has_state() ? id(wifi_ip).state.c_str() : "—");
+        dy += 22;
+        it.printf(50, dy, id(roboto16), black, TextAlign::TOP_LEFT,
+                  "SSID: %s", id(wifi_ssid).has_state() ? id(wifi_ssid).state.c_str() : "—");
+        dy += 30;
+
+        // Home Assistant
+        section("Home Assistant");
+        it.printf(50, dy, id(roboto16), black, TextAlign::TOP_LEFT,
+                  "API: %s", global_api_server->is_connected() ? "Connected" : "Disconnected");
+        dy += 30;
+
+        // System
+        section("System");
+        uint32_t up = millis() / 1000;
+        it.printf(50, dy, id(roboto16), black, TextAlign::TOP_LEFT,
+                  "Uptime: %lud %luh %lum",
+                  (unsigned long)(up / 86400), (unsigned long)((up / 3600) % 24),
+                  (unsigned long)((up / 60) % 60));
+        dy += 22;
+        it.printf(50, dy, id(roboto16), black, TextAlign::TOP_LEFT,
+                  "Free heap: %u KB", esp_get_free_heap_size() / 1024u);
+        dy += 22;
+        it.printf(50, dy, id(roboto16), black, TextAlign::TOP_LEFT,
+                  "Free PSRAM: %u KB",
+                  (unsigned)(heap_caps_get_free_size(MALLOC_CAP_SPIRAM) / 1024u));
+        dy += 22;
+        it.printf(50, dy, id(roboto16), black, TextAlign::TOP_LEFT,
+                  "ESPHome: %s", ESPHOME_VERSION);
+
+        // Footer hint
+        it.print(W / 2, 740, id(roboto16), black, TextAlign::TOP_CENTER,
+                 "Tap the top bar to leave");
+      } else if (id(active_room) == 5) {
+        // ── Living Room TV remote (Savant zone) ─────────────────────────────
+        std::string st  = id(lr_tv_state).has_state()  ? id(lr_tv_state).state  : std::string("");
+        std::string src = id(lr_tv_source).has_state() ? id(lr_tv_source).state : std::string("");
+        bool tv_on = !st.empty() && st != "off" && st != "unavailable" && st != "unknown";
+
+        // Header (y 100–176): zone label + state, power button on the right
+        it.rectangle(16, 100, W - 32, 76, black);
+        it.print(32, 124, id(roboto24), black, TextAlign::CENTER_LEFT, "Living Room TV");
+        it.print(32, 154, id(roboto16), black, TextAlign::CENTER_LEFT, tv_on ? "ON" : "OFF");
+        if (tv_on) {
+          id(t5_display).fast_rect(384, 108, 140, 60, black);
+          it.print(454, 138, id(roboto20), white, TextAlign::CENTER, "POWER");
+        } else {
+          it.rectangle(384, 108, 140, 60, black);
+          it.print(454, 138, id(roboto20), black, TextAlign::CENTER, "POWER");
+        }
+
+        // Input selector button (y 188–252)
+        it.rectangle(16, 188, W - 32, 64, black);
+        it.print(32, 220, id(roboto20), black, TextAlign::CENTER_LEFT, "Input");
+        std::string src_label = src.empty() ? std::string("—") : src;
+        if (src_label.length() > 22) src_label = src_label.substr(0, 20) + "..";
+        it.print(W - 32, 220, id(roboto20), black, TextAlign::CENTER_RIGHT, src_label.c_str());
+
+        // D-pad cluster: up / left-select-right / down (chevron glyphs)
+        auto dpad = [&](int x, int y, const char *glyph, const char *label) {
+          it.rectangle(x, y, 120, 100, black);
+          if (glyph) it.print(x + 60, y + 50, id(mdi40), black, TextAlign::CENTER, glyph);
+          if (label) it.print(x + 60, y + 50, id(roboto32), black, TextAlign::CENTER, label);
+        };
+        dpad(84,  280, nullptr, "HOME");         // home (nav) — top-left of cross
+        dpad(210, 280, "\U000F0143", nullptr);  // up
+        dpad(84,  388, "\U000F0141", nullptr);  // left
+        dpad(210, 388, nullptr, "OK");          // select
+        dpad(336, 388, "\U000F0142", nullptr);  // right
+        dpad(210, 496, "\U000F0140", nullptr);  // down
+
+        // Volume rocker (y 626–722) with current zone level above
+        float vpct = id(lr_tv_volume).has_state() ? id(lr_tv_volume).state * 100.0f : NAN;
+        if (!isnan(vpct))
+          it.printf(W / 2, 604, id(roboto16), black, TextAlign::TOP_CENTER, "Volume  %.0f%%", vpct);
+        else
+          it.print(W / 2, 604, id(roboto16), black, TextAlign::TOP_CENTER, "Volume");
+        it.rectangle(84, 626, 186, 96, black);
+        it.print(177, 674, id(roboto32), black, TextAlign::CENTER, "VOL -");
+        it.rectangle(276, 626, 186, 96, black);
+        it.print(369, 674, id(roboto32), black, TextAlign::CENTER, "VOL +");
       }
 
       // ── Room picker overlay ───────────────────────────────────────────────
       if (id(show_room_picker)) {
-        // Semi-opaque overlay: white-filled panel with black border (3 rooms = 460px)
-        id(t5_display).fast_rect(30, 160, W - 60, 460, white);
-        it.rectangle(30, 160, W - 60, 460, black);
-        it.rectangle(31, 161, W - 62, 458, black);  // double border
+        static const char *picker_rooms[]   = {"Office", "Living Room", "Climate", "Living Room TV"};
+        static const int    picker_indices[] = {0, 1, 2, 5};
+        const int NP = sizeof(picker_indices) / sizeof(picker_indices[0]);
+        // Rows start y=220, 116px tall, 120px pitch; last row bottom = 694.
+        int panel_h = 220 + NP * 120 - 2 + 116 - 160 + 56;  // rows + cancel margin
+
+        id(t5_display).fast_rect(30, 160, W - 60, panel_h, white);
+        it.rectangle(30, 160, W - 60, panel_h, black);
+        it.rectangle(31, 161, W - 62, panel_h - 2, black);  // double border
 
         it.print(W / 2, 185, id(roboto24), black, TextAlign::CENTER, "Select Room");
         it.horizontal_line(30, 210, W - 60, black);
 
-        // Room rows — y 200 each 120px (matching touch handler)
-        static const char *picker_rooms[] = {"Office", "Living Room", "Climate"};
-        for (int i = 0; i < 3; i++) {
+        for (int i = 0; i < NP; i++) {
           int ry = 220 + i * 120;
-          if (i == id(active_room)) {
-            // Highlight current room
+          if (picker_indices[i] == id(active_room)) {
             id(t5_display).fast_rect(32, ry - 2, W - 64, 116, black);
             it.print(80, ry + 55, id(roboto24), white, TextAlign::CENTER_LEFT, picker_rooms[i]);
             it.print(W / 2 + 160, ry + 55, id(mdi40), white, TextAlign::CENTER_RIGHT, "\U000F05E0");  // check-circle
@@ -927,9 +1368,47 @@ display:
           }
         }
 
-        // Cancel button (inside panel, below Climate row)
-        it.rectangle(120, 584, 300, 30, black);
-        it.print(W / 2, 599, id(roboto16), black, TextAlign::CENTER, "Cancel");
+        // Cancel button (inside panel, below the last row)
+        int cancel_y = 220 + NP * 120 - 2 + 116 + 8;
+        it.rectangle(120, cancel_y, 300, 30, black);
+        it.print(W / 2, cancel_y + 15, id(roboto16), black, TextAlign::CENTER, "Cancel");
+      }
+
+      // ── Input picker overlay (Living Room TV) ─────────────────────────────
+      if (id(show_input_picker)) {
+        auto &srcs = id(tv_source_list);
+        int n = (int)srcs.size();
+        // Rows start y=200, 80px tall, 84px pitch (matching touch handler).
+        int panel_h = (n > 0 ? 200 + n * 84 + 8 + 34 : 200 + 90) - 140 + 16;
+
+        id(t5_display).fast_rect(30, 140, W - 60, panel_h, white);
+        it.rectangle(30, 140, W - 60, panel_h, black);
+        it.rectangle(31, 141, W - 62, panel_h - 2, black);
+
+        it.print(W / 2, 165, id(roboto24), black, TextAlign::CENTER, "Select Input");
+        it.horizontal_line(30, 190, W - 60, black);
+
+        if (n == 0) {
+          it.print(W / 2, 235, id(roboto16), black, TextAlign::TOP_CENTER,
+                   "No sources yet (source_list empty)");
+        } else {
+          std::string cur = id(lr_tv_source).has_state() ? id(lr_tv_source).state : std::string("");
+          for (int i = 0; i < n; i++) {
+            int ry = 200 + i * 84;
+            if (cur == srcs[i]) {
+              id(t5_display).fast_rect(40, ry, W - 80, 80, black);
+              it.print(64, ry + 40, id(roboto24), white, TextAlign::CENTER_LEFT, srcs[i].c_str());
+              it.print(W - 64, ry + 40, id(mdi40), white, TextAlign::CENTER_RIGHT, "\U000F05E0");  // check-circle
+            } else {
+              it.rectangle(40, ry, W - 80, 80, black);
+              it.print(64, ry + 40, id(roboto24), black, TextAlign::CENTER_LEFT, srcs[i].c_str());
+            }
+          }
+        }
+
+        int cancel_y = (n > 0 ? 200 + n * 84 + 8 : 290);
+        it.rectangle(120, cancel_y, 300, 34, black);
+        it.print(W / 2, cancel_y + 17, id(roboto20), black, TextAlign::CENTER, "Cancel");
       }
 
       // ── Bottom info strip ─────────────────────────────────────────────────
@@ -950,7 +1429,10 @@ display:
 
         if (!isnan(pct_f) && pct_f >= 0) {
           int pct = (int)pct_f;
-          bool charging = !isnan(ma_f) && ma_f > 0;
+          // "Charging" = USB plugged in. Don't use ma_f > 0 — the gauge's
+          // current goes to ~0 once the battery is topped off (CV taper),
+          // even though USB is still connected.
+          bool charging = id(t5_display).charger_present();
 
           // Pick the right MDI battery icon
           const char *bat_icon;

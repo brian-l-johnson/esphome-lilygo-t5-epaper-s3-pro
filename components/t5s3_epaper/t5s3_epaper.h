@@ -37,6 +37,18 @@ class T5S3Epaper : public display::DisplayBuffer {
   float get_battery_mv()   { this->refresh_battery_(); return cached_battery_mv_; }
   float get_battery_ma()   { this->refresh_battery_(); return cached_battery_ma_; }
 
+  // BQ25896 charger status. The fuel gauge's current reading goes to ~0
+  // when the battery is topped off, so it can't tell you "USB is plugged
+  // in but no current is flowing". The charger can.
+  //
+  // get_charger_vbus() returns: 0=no input, 1=USB SDP, 2=adapter, 7=OTG
+  // get_charger_state() returns: 0=not charging, 1=pre-charge, 2=fast,
+  //                              3=charge termination done
+  uint8_t get_charger_vbus()  { this->refresh_battery_(); return (cached_charger_status_ >> 5) & 0x07; }
+  uint8_t get_charger_state() { this->refresh_battery_(); return (cached_charger_status_ >> 3) & 0x03; }
+  bool charger_present()      { return this->get_charger_vbus() != 0 && this->get_charger_vbus() != 7; }
+  bool charger_active()       { uint8_t s = this->get_charger_state(); return s == 1 || s == 2; }
+
   void request_full_refresh() { full_refresh_ = true; }
   // Coalesced refresh request — collects bursts of HA state changes into a
   // single re-render after a short settling window. Use this for HA state
@@ -106,11 +118,13 @@ class T5S3Epaper : public display::DisplayBuffer {
   SemaphoreHandle_t flush_sem_{nullptr};
   SemaphoreHandle_t done_sem_{nullptr};
 
-  // Cached battery readings — bq27220_read_reg is blocking I2C; the display
-  // lambda hits all three every render. Throttle to one refresh per 10s.
+  // Cached battery + charger readings — every read is a blocking I2C
+  // transaction; the display lambda hits these several times per render.
+  // Throttle to one refresh per 10 s.
   float cached_battery_pct_{NAN};
   float cached_battery_mv_{NAN};
   float cached_battery_ma_{NAN};
+  uint8_t cached_charger_status_{0};
   uint32_t battery_last_read_ms_{0};
   static constexpr uint32_t BATTERY_CACHE_MS = 10000;
 };

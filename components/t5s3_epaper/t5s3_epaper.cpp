@@ -884,12 +884,33 @@ void T5S3Epaper::fast_rect(int x, int y, int w, int h, Color color) {
 void T5S3Epaper::refresh_battery_() {
   uint32_t now = millis();
   // Force a read on first call (last_read_ms_=0 + cache=NAN); after that,
-  // throttle so the display lambda's three calls per render collapse to one.
+  // throttle so the display lambda's several calls per render collapse to one.
   if (battery_last_read_ms_ != 0 && (now - battery_last_read_ms_) < BATTERY_CACHE_MS)
     return;
   cached_battery_pct_ = bq27220_read_reg(0x2C, false);
   cached_battery_mv_  = bq27220_read_reg(0x08, false);
   cached_battery_ma_  = bq27220_read_reg(0x14, true);
+
+  // BQ25896 status reg 0x0B — VBUS + charge state. One-byte register.
+  uint8_t st = 0;
+  i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+  i2c_master_start(cmd);
+  i2c_master_write_byte(cmd, (0x6Bu << 1) | I2C_MASTER_WRITE, true);
+  i2c_master_write_byte(cmd, 0x0B, true);
+  i2c_master_stop(cmd);
+  esp_err_t ret = i2c_master_cmd_begin(S3_I2C_PORT, cmd, pdMS_TO_TICKS(100));
+  i2c_cmd_link_delete(cmd);
+  if (ret == ESP_OK) {
+    cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (0x6Bu << 1) | I2C_MASTER_READ, true);
+    i2c_master_read_byte(cmd, &st, I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    ret = i2c_master_cmd_begin(S3_I2C_PORT, cmd, pdMS_TO_TICKS(100));
+    i2c_cmd_link_delete(cmd);
+    if (ret == ESP_OK) cached_charger_status_ = st;
+  }
+
   battery_last_read_ms_ = now;
 }
 
