@@ -482,9 +482,10 @@ touchscreen:
               id(t5_display).update();
               return;
             }
-            // D-pad cluster (+ Home in the top-left corner)
+            // D-pad cluster (+ Home top-left, Back top-right)
             if (ty >= 280 && ty <= 380 && tx >= 84  && tx <= 204) { id(lr_tv_cmd).execute("home");   return; }
             if (ty >= 280 && ty <= 380 && tx >= 210 && tx <= 330) { id(lr_tv_cmd).execute("up");     return; }
+            if (ty >= 280 && ty <= 380 && tx >= 336 && tx <= 456) { id(lr_tv_cmd).execute("exit");   return; }
             if (ty >= 388 && ty <= 488) {
               if (tx >= 84  && tx <= 204) { id(lr_tv_cmd).execute("left");   return; }
               if (tx >= 210 && tx <= 330) { id(lr_tv_cmd).execute("select"); return; }
@@ -1324,6 +1325,7 @@ display:
         };
         dpad(84,  280, nullptr, "HOME");         // home (nav) — top-left of cross
         dpad(210, 280, "\U000F0143", nullptr);  // up
+        dpad(336, 280, nullptr, "BACK");         // back (nav) — top-right of cross
         dpad(84,  388, "\U000F0141", nullptr);  // left
         dpad(210, 388, nullptr, "OK");          // select
         dpad(336, 388, "\U000F0142", nullptr);  // right
